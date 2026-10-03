@@ -223,6 +223,8 @@ class TieredGPUOffload:
             self.clock += 1
             self._log(f"{entry}: GPU#{item.tier + 1} -> GPU#0")
 
+        if item is None:
+            self._log(f"{entry}: RAM -> GPU#0")
         self._install_block(entry, tensors)
         tensors.clear()
 
