@@ -1,49 +1,30 @@
-"""Tiered Multi-GPU cache for MMGP.
+"""Multi-GPU model sharding for WanGP/MMGP using Hugging Face Accelerate.
 
-The normal WanGP/MMGP model remains RAM-backed. GPU#0 is the active execution
-device. When MMGP evicts a block, this module keeps the GPU copy on GPU#1,
-then GPU#2, ... before finally dropping it back to the original RAM tensor.
+MMGP remains responsible for discovering/loading models and model switching.
+Accelerate owns the residency of an active model:
+
+    GPU#0 -> GPU#1 -> ... -> CPU
+
+Unlike the old cache implementation, this does not copy an evicted block to a
+second GPU and then try to restore it later. The complete active model is
+dispatched once using Accelerate's device map, so a large model can actually
+execute with parameters resident on multiple GPUs.
 """
 from __future__ import annotations
 
 import gc
 import types
-from dataclasses import dataclass
 
 import torch
 
 
-def _parameter(tensor):
-    if torch.is_inference_mode_enabled():
-        with torch.inference_mode(False):
-            return torch.nn.Parameter(tensor, requires_grad=False)
-    return torch.nn.Parameter(tensor, requires_grad=False)
-
-
-def _buffer(tensor):
-    if torch.is_inference_mode_enabled():
-        with torch.inference_mode(False):
-            return torch.nn.Buffer(tensor)
-    return torch.nn.Buffer(tensor)
-
-
-@dataclass
-class _CachedBlock:
-    tier: int
-    size: int
-    tensors: dict[int, torch.Tensor]
-    last_used: int
-
-
-class TieredGPUOffload:
+class AccelerateMultiGPU:
     def __init__(self, offload, devices: list[str], fraction: float = 0.82, verbose: int = 1):
         self.offload = offload
         self.devices = [torch.device(d) for d in devices]
-        self.fraction = max(0.05, min(float(fraction), 0.98))
+        self.fraction = max(0.50, min(float(fraction), 0.98))
         self.verbose = int(verbose)
-        self.cache: dict[str, _CachedBlock] = {}
-        self.used = [0] * max(0, len(self.devices) - 1)
-        self.clock = 0
+        self.dispatched: dict[str, torch.nn.Module] = {}
         self.installed = False
 
     @property
@@ -54,227 +35,203 @@ class TieredGPUOffload:
         if self.verbose >= 1:
             print(f"[MultiGPU] {message}", flush=True)
 
-    def _key(self, model_id, blocks_name):
-        return model_id if blocks_name is None else f"{model_id}/{blocks_name}"
+    def _restore_mmgp_forwards(self, model):
+        # MMGP wraps forwards with _mm_forward before profile() returns.
+        # Restore the wrapped function before Accelerate installs its own
+        # device hooks. This preserves MMGP LoRA wrappers, but removes the
+        # residency/offload checks that would otherwise fight Accelerate.
+        for module in model.modules():
+            previous = getattr(module, "_mm_forward", None)
+            if previous is not None:
+                module.forward = previous
 
-    def _index(self, device):
-        return device.index if device.index is not None else torch.cuda.current_device()
-
-    def _capacity(self, tier):
-        total = torch.cuda.get_device_properties(self._index(self.devices[tier + 1])).total_memory
-        return int(total * self.fraction)
-
-    def _size(self, entry):
-        return int(self.offload.blocks_of_modules_sizes.get(entry, 0))
-
-    def _clear_cache_entry(self, entry):
-        item = self.cache.pop(entry, None)
-        if item is None:
-            return
-        self.used[item.tier] -= item.size
-        item.tensors.clear()
-
-    def _demote(self, entry, target_tier):
-        item = self.cache.get(entry)
-        if item is None:
-            return
-
-        if target_tier >= len(self.used):
-            self._clear_cache_entry(entry)
-            self._log(f"{entry}: GPU#{item.tier + 1} -> RAM")
-            return
-
-        self._ensure_capacity(target_tier, item.size, exclude=entry)
-        target = self.devices[target_tier + 1]
-        moved = {}
+    def _remove_accelerate_hooks(self, model):
         try:
-            with torch.cuda.device(target):
-                for key, tensor in item.tensors.items():
-                    moved[key] = tensor.to(target, non_blocking=False)
+            from accelerate.hooks import remove_hook_from_submodules
+            remove_hook_from_submodules(model)
+        except ImportError:
+            pass
+
+    def _move_model_to_cpu(self, model):
+        self._remove_accelerate_hooks(model)
+        self._restore_mmgp_forwards(model)
+
+        try:
+            model.to("cpu")
         except Exception:
-            for tensor in moved.values():
-                del tensor
-            raise
+            # Some quantized modules do not implement .to(). Restore the
+            # original MMGP block tensors instead.
+            for model_id, candidate in self.offload.models.items():
+                if candidate is model:
+                    for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules.get(model_id, []):
+                        if tied is not None:
+                            setattr(parent, name, getattr(tied[0], tied[1]))
+                        else:
+                            setattr(parent, name, source)
+                    break
 
-        self.used[item.tier] -= item.size
-        self.used[target_tier] += item.size
-        old_tier = item.tier
-        item.tier = target_tier
-        item.tensors = moved
-        item.last_used = self.clock
-        self._log(f"{entry}: GPU#{old_tier + 1} -> GPU#{target_tier + 1}")
+    def _max_memory(self):
+        max_memory = {}
+        for device in self.devices:
+            index = device.index
+            free, _ = torch.cuda.mem_get_info(index)
+            budget = int(free * self.fraction)
+            max_memory[index] = max(1, budget)
 
-    def _ensure_capacity(self, tier, size, exclude=None):
-        capacity = self._capacity(tier)
-        while self.used[tier] + size > capacity:
-            candidates = [
-                (name, item.last_used)
-                for name, item in self.cache.items()
-                if item.tier == tier and name != exclude
-            ]
-            if not candidates:
-                raise RuntimeError(
-                    f"GPU#{tier + 1} cache cannot fit {size / 1024**2:.1f} MiB"
-                )
-            victim = min(candidates, key=lambda x: x[1])[0]
-            self._demote(victim, tier + 1)
+        # Do not cap CPU RAM here. Accelerate will use the currently available
+        # host memory and will only place weights there after GPU capacity is
+        # exhausted.
+        return max_memory
 
-    def _current_tensors(self, entry):
-        tensors = {}
-        for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules[entry]:
-            if tied is not None:
-                continue
-            current = getattr(parent, name)
-            if torch.is_tensor(current) and current.is_cuda:
-                tensors[id(source)] = current
-        return tensors
+    def _no_split_classes(self, model):
+        classes = list(getattr(model, "_no_split_modules", None) or [])
 
-    def _restore_cpu(self, entry):
-        model_id = entry.split("/", 1)[0]
+        # Custom diffusion models often do not expose Transformers'
+        # _no_split_modules. Keep common transformer/residual blocks intact.
+        common = {
+            "BasicAVTransformerBlock",
+            "BasicTransformerBlock",
+            "TransformerBlock",
+            "LTXVTransformerBlock",
+            "LTXTransformerBlock",
+            "Gemma3DecoderLayer",
+            "WanTransformerBlock",
+            "Wan2TransformerBlock",
+        }
+        known = {module.__class__.__name__ for module in model.modules()}
+        for name in common:
+            if name in known and name not in classes:
+                classes.append(name)
+        return classes
+
+    def _dispatch(self, model_id):
         model = self.offload.models[model_id]
-        lora_modules = {}
-        active = getattr(model, "_loras_active_adapters", None)
-        lora_data = getattr(model, "_loras_model_data", None) if active else None
 
-        for parent, name, source, is_buffer, _ in self.offload.blocks_of_modules[entry]:
-            q = _buffer(source) if is_buffer else _parameter(source)
-            setattr(parent, name, q)
-            if lora_data is not None and parent in lora_data:
-                lora_modules[parent] = lora_data[parent]
+        if model_id in self.dispatched:
+            return self.dispatched[model_id]
 
-        if active and lora_modules:
-            self.offload._move_loras(active, lora_modules, False, model)
+        self._restore_mmgp_forwards(model)
+        self._remove_accelerate_hooks(model)
 
-    def _install_block(self, entry, tensors):
-        target = self.devices[0]
-        for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules[entry]:
-            if tied is not None:
-                tied_value = getattr(tied[0], tied[1])
-                setattr(parent, name, tied_value)
-                continue
+        max_memory = self._max_memory()
 
-            cached = tensors.get(id(source))
-            q = source.to(target, non_blocking=False) if cached is None else cached.to(target, non_blocking=False)
-            q = _buffer(q) if is_buffer else _parameter(q)
-            setattr(parent, name, q)
+        from accelerate import dispatch_model
+        from accelerate.utils import get_balanced_memory, infer_auto_device_map
 
-        model_id = entry.split("/", 1)[0]
-        model = self.offload.models[model_id]
-        active = getattr(model, "_loras_active_adapters", None)
-        lora_data = getattr(model, "_loras_model_data", None) if active else None
-        if active and lora_data is not None:
-            modules = {}
-            for parent, _, _, _, _ in self.offload.blocks_of_modules[entry]:
-                if parent in lora_data:
-                    modules[parent] = lora_data[parent]
-            if modules:
-                self.offload._move_loras(active, modules, True, model)
+        no_split = self._no_split_classes(model)
 
-    def unload(self, model_id, blocks_name, cache=True):
-        entry = self._key(model_id, blocks_name)
+        balanced_memory = get_balanced_memory(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=no_split,
+            low_zero=False,
+        )
 
-        if blocks_name is not None and blocks_name == self.offload.loaded_blocks[model_id]:
-            self.offload.loaded_blocks[model_id] = None
+        device_map = infer_auto_device_map(
+            model,
+            max_memory=balanced_memory,
+            no_split_module_classes=no_split,
+            clean_result=True,
+            offload_buffers=True,
+        )
 
-        # MMGP treats active_models_ids as proof that the model's base block
-        # is resident on GPU#0. If the base block is demoted to a secondary
-        # GPU, remove the model from the active set so ensure_model_loaded()
-        # restores it before the next forward.
-        if blocks_name is None and model_id in getattr(self.offload, "active_models_ids", []):
-            self.offload.active_models_ids = [active_id for active_id in self.offload.active_models_ids if active_id != model_id]
-            self.offload.active_models = [
-                model for model in self.offload.active_models
-                if getattr(model, "_mm_id", None) != model_id
-            ]
+        # Make the map visible in the log. This is much more useful than
+        # pretending that a block was merely "cached" on GPU#1.
+        counts = {}
+        for device in device_map.values():
+            key = str(device)
+            counts[key] = counts.get(key, 0) + 1
 
-        if entry not in self.offload.blocks_of_modules:
-            return
+        self._log(
+            f"{model_id}: Accelerate device map "
+            + ", ".join(f"{device}={count}" for device, count in counts.items())
+        )
 
-        current = self._current_tensors(entry)
-        if not current:
-            return
+        dispatched = dispatch_model(
+            model,
+            device_map=device_map,
+            main_device=self.devices[0],
+            offload_buffers=True,
+            force_hooks=True,
+        )
 
-        if not cache:
-            self._restore_cpu(entry)
-            return
-
-        size = self._size(entry)
-        try:
-            self._ensure_capacity(0, size)
-            target = self.devices[1]
-            moved = {}
-            with torch.cuda.device(target):
-                for key, tensor in current.items():
-                    moved[key] = tensor.to(target, non_blocking=False)
-            self._restore_cpu(entry)
-            self.cache[entry] = _CachedBlock(0, size, moved, self.clock)
-            self.used[0] += size
-            self._log(f"{entry}: GPU#0 -> GPU#1")
-        except (RuntimeError, torch.cuda.OutOfMemoryError):
-            for tensor in current.values():
-                del tensor
-            self._restore_cpu(entry)
-            self._clear_cache_entry(entry)
-            gc.collect()
-            torch.cuda.empty_cache()
-            self._log(f"{entry}: GPU#0 -> RAM")
+        self.dispatched[model_id] = dispatched
+        return dispatched
 
     def load(self, model_id, blocks_name, preload=False):
-        entry = self._key(model_id, blocks_name)
+        # A dispatched model owns all of its internal blocks. MMGP must not
+        # subsequently pull individual blocks back to GPU#0.
+        if blocks_name is not None:
+            return
 
-        loaded = self.offload.loaded_blocks[model_id]
-        if not preload and loaded is not None and loaded != blocks_name:
-            self.unload(model_id, loaded, cache=True)
+        model = self._dispatch(model_id)
+        self.offload.loaded_blocks[model_id] = None
 
-        item = self.cache.pop(entry, None)
-        tensors = {}
-        if item is not None:
-            self.used[item.tier] -= item.size
-            tensors = item.tensors
-            self.clock += 1
-            self._log(f"{entry}: GPU#{item.tier + 1} -> GPU#0")
+        gpu_parts = []
+        for name, module in model.named_modules():
+            if not any(True for _ in module.parameters(recurse=False)):
+                continue
+            param = next(module.parameters(recurse=False), None)
+            if param is not None:
+                gpu_parts.append((name or "<root>", str(param.device)))
 
-        if item is None:
-            self._log(f"{entry}: RAM -> GPU#0")
-        self._install_block(entry, tensors)
-        tensors.clear()
+        devices_used = sorted(set(device for _, device in gpu_parts))
+        self._log(f"{model_id}: active on " + ", ".join(devices_used))
 
-        if not preload:
-            self.offload.loaded_blocks[model_id] = blocks_name
-        self.clock += 1
+    def unload(self, model_id, blocks_name):
+        if blocks_name is not None:
+            return
 
-    def _release_cache(self):
-        for item in self.cache.values():
-            item.tensors.clear()
-        self.cache.clear()
-        self.used = [0] * len(self.used)
+        model = self.dispatched.pop(model_id, None)
+        if model is None:
+            return
+
+        self._log(f"{model_id}: releasing Accelerate dispatch -> RAM")
+        self._move_model_to_cpu(model)
+        self.offload.loaded_blocks[model_id] = None
         gc.collect()
         torch.cuda.empty_cache()
 
     def unload_all(self):
         if not self.installed:
             return
+
         active_ids = list(dict.fromkeys(getattr(self.offload, "active_models_ids", []) or []))
         for model_id in active_ids:
-            loaded = self.offload.loaded_blocks[model_id]
-            if loaded is not None:
-                self.unload(model_id, loaded, cache=True)
-            self.unload(model_id, None, cache=True)
+            self.unload(model_id, None)
+
         self.offload.active_models = []
         self.offload.active_models_ids = []
         gc.collect()
         torch.cuda.empty_cache()
-        self._log(f"Model switch: kept {len(self.cache)} block(s) in secondary GPU cache ({sum(self.used) / 1024**3:.2f} GiB)")
+
+    def ensure_model_loaded(self, obj, model_id):
+        if model_id in getattr(obj, "active_models_ids", []):
+            return
+
+        # Do not use MMGP's co-tenancy decision here. Two Accelerate-dispatched
+        # models can each legitimately occupy both GPUs, so keeping both alive
+        # defeats the purpose of the memory budget.
+        self.unload_all()
+
+        model = obj.models[model_id]
+        obj.active_models.append(model)
+        obj.active_models_ids.append(model_id)
+        self.load(model_id, None, preload=True)
 
     def release(self):
         if not self.installed:
             return
+
+        self.unload_all()
+
         self.offload.gpu_load_blocks = self._original_load
         self.offload.gpu_unload_blocks = self._original_unload
         self.offload.unload_all = self._original_unload_all
         self.offload.release = self._original_release
-        self._release_cache()
-        self._original_release()
+        self.offload.ensure_model_loaded = self._original_ensure_model_loaded
+
+        self.dispatched.clear()
         self.installed = False
 
     def install(self):
@@ -290,56 +247,76 @@ class TieredGPUOffload:
         self._original_release = self.offload.release
         self._original_ensure_model_loaded = self.offload.ensure_model_loaded
 
-        def ensure_model_loaded(obj, model_id):
-            entry = self._key(model_id, None)
-            if model_id not in getattr(obj, "active_models_ids", []) and entry in self.cache:
-                self.load(model_id, None, preload=True)
-                model = obj.models[model_id]
-                obj.active_models.append(model)
-                obj.active_models_ids.append(model_id)
-                self._log(f"{entry}: GPU cache restored; model activated")
-                return
-            self._original_ensure_model_loaded(model_id)
-
-        self.offload.ensure_model_loaded = types.MethodType(ensure_model_loaded, self.offload)
-
         self.offload.gpu_load_blocks = types.MethodType(
             lambda obj, model_id, blocks_name, preload=False: self.load(model_id, blocks_name, preload),
             self.offload,
         )
         self.offload.gpu_unload_blocks = types.MethodType(
-            lambda obj, model_id, blocks_name: self.unload(model_id, blocks_name, cache=True),
+            lambda obj, model_id, blocks_name: self.unload(model_id, blocks_name),
             self.offload,
         )
         self.offload.unload_all = types.MethodType(
             lambda obj: self.unload_all(),
             self.offload,
         )
+        self.offload.ensure_model_loaded = types.MethodType(
+            self.ensure_model_loaded,
+            self.offload,
+        )
         self.offload.release = types.MethodType(
             lambda obj: self.release(),
             self.offload,
         )
+
         self.installed = True
-        self._log("Tiered offload: " + " -> ".join(f"GPU#{i}" for i in range(len(self.devices))) + " -> RAM")
+        self._log(
+            "Accelerate multi-GPU: "
+            + " -> ".join(f"GPU#{i}" for i in range(len(self.devices)))
+            + " -> RAM"
+        )
         return self
 
 
 def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
     devices = [part.strip() for part in str(device_spec or "").split(",") if part.strip()]
     normalized = [part if part.startswith("cuda:") else f"cuda:{part}" for part in devices]
+
     if len(normalized) < 2:
         return None
     if not torch.cuda.is_available():
         raise RuntimeError("MultiGPU requires CUDA")
+
     for device in normalized:
         index = torch.device(device).index
         if index is None or index < 0 or index >= torch.cuda.device_count():
             raise ValueError(f"Invalid MultiGPU CUDA device: {device}")
+
     torch.cuda.set_device(torch.device(normalized[0]))
-    manager = TieredGPUOffload(offload, normalized, fraction=fraction, verbose=verbose)
+
+    manager = AccelerateMultiGPU(
+        offload,
+        normalized,
+        fraction=fraction,
+        verbose=verbose,
+    )
+
+    # MMGP's async prefetch and residency are incompatible with a static
+    # multi-device dispatch. Accelerate now owns model residency.
     if hasattr(offload, "async_transfers"):
         offload.async_transfers = False
 
+    for model_id in getattr(offload, "preloaded_blocks_per_model", {}):
+        offload.preloaded_blocks_per_model[model_id] = []
+
     manager.install()
     offload.multigpu = manager
+
+    for no, device in enumerate(manager.devices):
+        idx = manager._index(device) if hasattr(manager, "_index") else device.index
+        free, total = torch.cuda.mem_get_info(idx)
+        manager._log(
+            f"GPU#{no} cuda:{idx}: {free / 1024**3:.2f} GiB free / "
+            f"{total / 1024**3:.2f} GiB total"
+        )
+
     return manager
