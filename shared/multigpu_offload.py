@@ -126,6 +126,81 @@ class AccelerateMultiGPU:
                 classes.append(name)
         return classes
 
+    def _patch_accelerate_quanto(self):
+        """Make Accelerate dispatch compatible with optimum-quanto weights.
+
+        Accelerate's generic parameter path reconstructs the parameter as
+        type(param)(tensor) after moving it. That is valid for nn.Parameter
+        and bitsandbytes parameters, but not for optimum-quanto weights.
+        Quanto already implements the correct tensor.to(device) operation,
+        so keep the quantized wrapper intact.
+        """
+        try:
+            from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+        except Exception:
+            return
+
+        import accelerate.hooks as accelerate_hooks
+        import accelerate.utils.modeling as accelerate_modeling
+
+        if getattr(accelerate_hooks, "_wgp_quanto_patch", False):
+            return
+
+        original = accelerate_modeling.set_module_tensor_to_device
+
+        def set_module_tensor_to_device_compat(
+            module, tensor_name, device, value=None, dtype=None,
+            fp16_statistics=None, tied_params_map=None, non_blocking=False,
+            clear_cache=True,
+        ):
+            if "." in tensor_name:
+                parts = tensor_name.split(".")
+                for part in parts[:-1]:
+                    module = getattr(module, part)
+                tensor_name = parts[-1]
+
+            old_value = getattr(module, tensor_name)
+            if isinstance(old_value, WeightQBytesTensor):
+                if value is not None:
+                    if not isinstance(value, WeightQBytesTensor):
+                        return original(
+                            module, tensor_name, device, value=value, dtype=dtype,
+                            fp16_statistics=fp16_statistics,
+                            tied_params_map=tied_params_map,
+                            non_blocking=non_blocking,
+                            clear_cache=clear_cache,
+                        )
+                    new_value = value.to(device, non_blocking=non_blocking)
+                else:
+                    new_value = old_value.to(device, non_blocking=non_blocking)
+
+                module._parameters[tensor_name] = new_value
+                if clear_cache and torch.device(device).type == "cuda":
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return
+
+            return original(
+                module, tensor_name, device, value=value, dtype=dtype,
+                fp16_statistics=fp16_statistics,
+                tied_params_map=tied_params_map,
+                non_blocking=non_blocking,
+                clear_cache=clear_cache,
+            )
+
+        accelerate_modeling.set_module_tensor_to_device = set_module_tensor_to_device_compat
+        accelerate_hooks.set_module_tensor_to_device = set_module_tensor_to_device_compat
+        try:
+            import accelerate.utils as accelerate_utils
+            accelerate_utils.set_module_tensor_to_device = set_module_tensor_to_device_compat
+        except Exception:
+            pass
+
+        accelerate_hooks._wgp_quanto_patch = True
+        self._log("Accelerate Quanto compatibility enabled")
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
