@@ -339,16 +339,37 @@ class AccelerateMultiGPU:
         from accelerate.utils import infer_auto_device_map
 
         no_split = self._no_split_classes(model)
-        device_map = self._gemma_device_map(model)
+        device_map = None
+        if getattr(model, "model", None) is not None and getattr(getattr(model, "model", None), "layers", None) is not None:
+            try:
+                from accelerate.utils import get_balanced_memory
+                balanced_memory = get_balanced_memory(
+                    model,
+                    max_memory=self._max_memory(),
+                    no_split_module_classes=no_split,
+                    low_zero=True,
+                )
+                device_map = infer_auto_device_map(
+                    model,
+                    max_memory=balanced_memory,
+                    no_split_module_classes=no_split,
+                    clean_result=True,
+                    offload_buffers=False,
+                    fallback_allocation=True,
+                )
+                if any(str(v) in ("cpu", "disk", "meta") for v in device_map.values()):
+                    device_map = self._gemma_device_map(model)
+            except Exception:
+                device_map = self._gemma_device_map(model)
 
         if device_map is not None:
-            self._log(f"{model_id}: using contiguous Gemma GPU + RAM layer split")
+            self._log(f"{model_id}: using Accelerate balanced-low-0 GPU split")
         else:
             # Generic models still use Accelerate's allocator. fallback_allocation
             # is enabled so it can recover from an unlucky first-fit placement.
             device_map = infer_auto_device_map(
                 model,
-                max_memory=max_memory,
+                max_memory=self._max_memory(),
                 no_split_module_classes=no_split,
                 clean_result=True,
                 offload_buffers=False,
@@ -429,3 +450,105 @@ class AccelerateMultiGPU:
         devices_used = set()
         for module in model.modules():
             param = next(module.parameters(recurse=False), None)
+
+    def unload(self, model_id, blocks_name=None, cache=True):
+        if blocks_name is not None:
+            return
+        model = self.dispatched.pop(model_id, None)
+        if model is None:
+            return
+        self._log(f"{model_id}: releasing Accelerate dispatch -> RAM")
+        self._move_model_to_cpu(model)
+        self.offload.loaded_blocks[model_id] = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def unload_all(self):
+        for model_id in list(self.dispatched):
+            self.unload(model_id, None)
+        self._release_mmgp()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _release_mmgp(self):
+        for model_id in list(self._suspended_mmgp_blocks):
+            self._restore_mmgp_blocks(model_id)
+
+    def release(self):
+        if not self.installed:
+            return
+        self.unload_all()
+        self.offload.gpu_load_blocks = self._original_load
+        self.offload.gpu_unload_blocks = self._original_unload
+        self.offload.unload_all = self._original_unload_all
+        self.offload.release = self._original_release
+        self.installed = False
+        try:
+            delattr(self.offload, "multigpu")
+        except AttributeError:
+            pass
+
+    def install(self):
+        if not self.enabled:
+            raise ValueError("MultiGPU requires at least two CUDA devices")
+        if self.installed:
+            return self
+
+        self._original_load = self.offload.gpu_load_blocks
+        self._original_unload = self.offload.gpu_unload_blocks
+        self._original_unload_all = self.offload.unload_all
+        self._original_release = self.offload.release
+
+        self.offload.gpu_load_blocks = types.MethodType(
+            lambda obj, model_id, blocks_name, preload=False: self.load(model_id, blocks_name, preload),
+            self.offload,
+        )
+        self.offload.gpu_unload_blocks = types.MethodType(
+            lambda obj, model_id, blocks_name: self.unload(model_id, blocks_name),
+            self.offload,
+        )
+        self.offload.unload_all = types.MethodType(
+            lambda obj: self.unload_all(),
+            self.offload,
+        )
+        self.offload.release = types.MethodType(
+            lambda obj: self.release(),
+            self.offload,
+        )
+        self.installed = True
+        self._log(
+            "Accelerate multi-GPU: " +
+            " -> ".join(f"GPU#{i}" for i in range(len(self.devices))) +
+            " -> RAM"
+        )
+        for no, device in enumerate(self.devices):
+            free, total = torch.cuda.mem_get_info(device.index)
+            self._log(
+                f"GPU#{no} {device}: {free / 1024**3:.2f} GiB free / "
+                f"{total / 1024**3:.2f} GiB total"
+            )
+        return self
+
+
+def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
+    devices = [x.strip() for x in str(device_spec or "").split(",") if x.strip()]
+    normalized = [x if x.startswith("cuda:") else f"cuda:{x}" for x in devices]
+    if len(normalized) < 2:
+        return None
+    if not torch.cuda.is_available():
+        raise RuntimeError("MultiGPU requires CUDA")
+    count = torch.cuda.device_count()
+    for name in normalized:
+        index = torch.device(name).index
+        if index is None or index < 0 or index >= count:
+            raise ValueError(f"Invalid MultiGPU CUDA device: {name}")
+    torch.cuda.set_device(torch.device(normalized[0]))
+    manager = AccelerateMultiGPU(
+        offload,
+        normalized,
+        fraction=fraction,
+        verbose=verbose,
+    )
+    manager.install()
+    offload.multigpu = manager
+    return manager
