@@ -288,6 +288,20 @@ class TieredGPUOffload:
         self._original_unload = self.offload.gpu_unload_blocks
         self._original_unload_all = self.offload.unload_all
         self._original_release = self.offload.release
+        self._original_ensure_model_loaded = self.offload.ensure_model_loaded
+
+        def ensure_model_loaded(obj, model_id):
+            entry = self._key(model_id, None)
+            if model_id not in getattr(obj, "active_models_ids", []) and entry in self.cache:
+                self.load(model_id, None, preload=True)
+                model = obj.models[model_id]
+                obj.active_models.append(model)
+                obj.active_models_ids.append(model_id)
+                self._log(f"{entry}: GPU cache restored; model activated")
+                return
+            self._original_ensure_model_loaded(model_id)
+
+        self.offload.ensure_model_loaded = types.MethodType(ensure_model_loaded, self.offload)
 
         self.offload.gpu_load_blocks = types.MethodType(
             lambda obj, model_id, blocks_name, preload=False: self.load(model_id, blocks_name, preload),
