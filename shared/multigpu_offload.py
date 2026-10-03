@@ -226,11 +226,14 @@ class AccelerateMultiGPU:
 
         no_split = self._no_split_classes(model)
 
+        # GPU#0 is also the execution/input/output device for WanGP. Do not
+        # balance Gemma evenly: Accelerate's low_zero mode reserves more
+        # headroom on the first GPU for inputs, outputs and temporary tensors.
         balanced_memory = get_balanced_memory(
             model,
             max_memory=max_memory,
             no_split_module_classes=no_split,
-            low_zero=False,
+            low_zero=True,
         )
 
         # Explicitly keep CPU as the last residency tier. There must never be
@@ -259,13 +262,30 @@ class AccelerateMultiGPU:
             + ", ".join(f"{device}={count}" for device, count in counts.items())
         )
 
+        # At verbose=2 expose the important root assignments. Gemma's tied
+        # embedding/lm_head can otherwise hide a large GPU#0 allocation.
+        if self.verbose >= 2:
+            for name in (
+                "model.embed_tokens",
+                "model.layers.0",
+                "model.layers.23",
+                "model.layers.24",
+                "model.layers.47",
+                "lm_head",
+                "model.norm",
+            ):
+                if name in device_map:
+                    self._log(f"{model_id}: {name} -> {device_map[name]}")
+
         self._patch_accelerate_quanto()
 
+        # Keep Accelerate's standard dispatch path. It handles cross-device
+        # activation transfers and tied-parameter bookkeeping.
         dispatched = dispatch_model(
             model,
             device_map=device_map,
             main_device=self.devices[0],
-            offload_buffers=True,
+            offload_buffers=False,
             force_hooks=True,
         )
 
