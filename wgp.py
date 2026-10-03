@@ -44,6 +44,7 @@ import warnings
 warnings.filterwarnings('ignore', message='Failed to find.*', module='triton')
 warnings.filterwarnings("ignore", message=r"Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower .* implementation\.\.\.", category=UserWarning, module=r"whisper\.timing")
 from mmgp import offload, safetensors2, profile_type , quant_router
+from shared.multigpu_offload import attach as attach_multigpu
 try:
     import triton
 except ImportError:
@@ -4200,6 +4201,13 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             _load_models_info("Pytorch compilation is not supported for this Model")
         # kwargs["pinnedMemory"] = "text_encoder"
         offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
+    if args.multigpu:
+        multigpu_devices = [x.strip() for x in args.multigpu.split(",") if x.strip()]
+        if args.gpu and args.gpu != multigpu_devices[0] and args.gpu != f"cuda:{multigpu_devices[0]}":
+            raise ValueError(f"--gpu ({args.gpu}) must match the first --multigpu device ({multigpu_devices[0]})")
+        if not args.gpu:
+            args.gpu = multigpu_devices[0]
+        attach_multigpu(offloadobj, args.multigpu, fraction=args.multigpu_cache_fraction, verbose=int(verbose_level))
     offloadobj.tiny_vae = preview_decoder
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
