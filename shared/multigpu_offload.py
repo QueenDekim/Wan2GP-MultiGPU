@@ -273,8 +273,11 @@ class AccelerateMultiGPU:
             size = int(sizes.get(name, 0))
             if current < len(self.devices) - 1 and used[current] + size > gpu_targets[current]:
                 current += 1
-            device_map[name] = self.devices[current]
-            used[current] += size
+            if current == len(self.devices) - 1 and used[current] + size > gpu_targets[current]:
+                device_map[name] = "cpu"
+            else:
+                device_map[name] = self.devices[current]
+                used[current] += size
 
         return device_map
 
