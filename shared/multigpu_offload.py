@@ -154,7 +154,7 @@ class TieredGPUOffload:
                 continue
 
             cached = tensors.get(id(source))
-            q = source.to(target, non_blocking=True) if cached is None else cached.to(target, non_blocking=True)
+            q = source.to(target, non_blocking=False) if cached is None else cached.to(target, non_blocking=False)
             q = _buffer(q) if is_buffer else _parameter(q)
             setattr(parent, name, q)
 
@@ -239,24 +239,19 @@ class TieredGPUOffload:
         torch.cuda.empty_cache()
 
     def unload_all(self):
-        # unload_all is expected to return everything to RAM, not populate the
-        # intermediate GPU cache. Temporarily restore MMGP's implementation.
         if not self.installed:
             return
-        self.offload.gpu_load_blocks = self._original_load
-        self.offload.gpu_unload_blocks = self._original_unload
-        try:
-            self._original_unload_all()
-        finally:
-            self.offload.gpu_load_blocks = types.MethodType(
-                lambda obj, model_id, blocks_name, preload=False: self.load(model_id, blocks_name, preload),
-                self.offload,
-            )
-            self.offload.gpu_unload_blocks = types.MethodType(
-                lambda obj, model_id, blocks_name: self.unload(model_id, blocks_name, cache=True),
-                self.offload,
-            )
-            self._release_cache()
+        active_ids = list(getattr(self.offload, "active_models_ids", []) or [])
+        for model_id in active_ids:
+            loaded = self.offload.loaded_blocks[model_id]
+            if loaded is not None:
+                self.unload(model_id, loaded, cache=True)
+            self.unload(model_id, None, cache=True)
+        self.offload.active_models = []
+        self.offload.active_models_ids = []
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._log(f"Model switch: kept {len(self.cache)} block(s) in secondary GPU cache ({sum(self.used) / 1024**3:.2f} GiB)")
 
     def release(self):
         if not self.installed:
@@ -315,11 +310,8 @@ def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
             raise ValueError(f"Invalid MultiGPU CUDA device: {device}")
     torch.cuda.set_device(torch.device(normalized[0]))
     manager = TieredGPUOffload(offload, normalized, fraction=fraction, verbose=verbose)
-
-    # MMGP preloading keeps extra blocks resident on GPU#0. That conflicts
-    # with tiered offload, where secondary GPUs are the persistent cache.
-    for model_id in getattr(offload, "preloaded_blocks_per_model", {}):
-        offload.preloaded_blocks_per_model[model_id] = []
+    if hasattr(offload, "async_transfers"):
+        offload.async_transfers = False
 
     manager.install()
     offload.multigpu = manager
