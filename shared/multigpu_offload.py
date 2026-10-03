@@ -45,6 +45,14 @@ class AccelerateMultiGPU:
             if previous is not None:
                 module.forward = previous
 
+            # MMGP installs a fake _hf_hook. Accelerate also uses this attribute,
+            # so the fake hook must not survive into dispatch_model.
+            if hasattr(module, "_hf_hook"):
+                try:
+                    delattr(module, "_hf_hook")
+                except AttributeError:
+                    pass
+
     def _remove_accelerate_hooks(self, model):
         try:
             from accelerate.hooks import remove_hook_from_submodules
