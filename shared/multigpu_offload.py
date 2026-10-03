@@ -307,6 +307,13 @@ def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
     normalized = [part if part.startswith("cuda:") else f"cuda:{part}" for part in devices]
     if len(normalized) < 2:
         return None
+    if not torch.cuda.is_available():
+        raise RuntimeError("MultiGPU requires CUDA")
+    for device in normalized:
+        index = torch.device(device).index
+        if index is None or index < 0 or index >= torch.cuda.device_count():
+            raise ValueError(f"Invalid MultiGPU CUDA device: {device}")
+    torch.cuda.set_device(torch.device(normalized[0]))
     manager = TieredGPUOffload(offload, normalized, fraction=fraction, verbose=verbose)
     manager.install()
     offload.multigpu = manager
