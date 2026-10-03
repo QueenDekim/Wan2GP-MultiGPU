@@ -230,6 +230,48 @@ class AccelerateMultiGPU:
         accelerate_hooks._wgp_quanto_patch = True
         self._log("Accelerate Quanto compatibility enabled")
 
+
+    def _gemma_gpu_only_map(self, model):
+        """Build a simple contiguous GPU-only map for Gemma-style decoder LMs.
+
+        Accelerate's automatic allocator always reserves room on GPU 0 for a
+        possible CPU-offloaded layer. That is useful for generic CPU offload,
+        but it can unnecessarily spill a model to disk when the complete
+        quantized model already fits across the configured GPUs.
+        """
+        backbone = getattr(model, "model", None)
+        layers = getattr(backbone, "layers", None)
+        if layers is None or len(layers) < 2:
+            return None
+
+        ndev = len(self.devices)
+        if ndev < 2:
+            return None
+
+        # Gemma ties lm_head.weight to model.embed_tokens.weight. Keep both
+        # aliases on the same GPU so Accelerate can preserve the shared tensor.
+        device_map = {
+            "model.embed_tokens": self.devices[0],
+            "lm_head": self.devices[0],
+        }
+
+        # Small non-layer modules are cheap; put them on the last GPU to keep
+        # the first GPU focused on the input embedding and first decoder block.
+        for name, module in backbone.named_children():
+            if name == "layers":
+                continue
+            device_map[f"model.{name}"] = self.devices[-1]
+
+        # Gemma decoder blocks are intentionally kept contiguous. Equal-sized
+        # blocks make a count-based split more stable than Accelerate's
+        # conservative auto allocator for Quanto tensors.
+        total = len(layers)
+        for i in range(total):
+            device_index = min((i * ndev) // total, ndev - 1)
+            device_map[f"model.layers.{i}"] = self.devices[device_index]
+
+        return device_map
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -258,13 +300,25 @@ class AccelerateMultiGPU:
         # Do not call get_balanced_memory(). It can deliberately reserve space
         # for a CPU/disk tier. Here Accelerate is only the GPU sharder; MMGP
         # remains responsible for RAM residency between model uses.
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=no_split,
-            clean_result=True,
-            offload_buffers=False,
-        )
+        # Gemma/Quanto: prefer an explicit contiguous GPU-only split.
+        # Accelerate's generic allocator reserves GPU#0 space for a potential
+        # CPU/disk tier and can therefore choose "disk" even when the model
+        # fits comfortably across both GPUs.
+        device_map = self._gemma_gpu_only_map(model)
+
+        if device_map is not None:
+            self._log(f"{model_id}: using contiguous GPU-only Gemma layer split")
+        else:
+            # Generic models still use Accelerate's allocator. fallback_allocation
+            # is enabled so it can recover from an unlucky first-fit placement.
+            device_map = infer_auto_device_map(
+                model,
+                max_memory=max_memory,
+                no_split_module_classes=no_split,
+                clean_result=True,
+                offload_buffers=False,
+                fallback_allocation=True,
+            )
 
         counts = {}
         for device in device_map.values():
@@ -275,8 +329,9 @@ class AccelerateMultiGPU:
         if invalid:
             raise RuntimeError(
                 f"Accelerate could not fit {model_id} on the configured GPUs: "
-                f"{device_map}. CPU/disk dispatch is intentionally disabled; "
-                "increase the MultiGPU fraction or use a quantized checkpoint."
+                f"{device_map}. GPU-only dispatch is required for the active "
+                "multi-GPU tier; use a smaller/quantized checkpoint or increase "
+                "the available VRAM."
             )
 
         self._log(
