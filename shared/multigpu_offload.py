@@ -259,6 +259,8 @@ class AccelerateMultiGPU:
             + ", ".join(f"{device}={count}" for device, count in counts.items())
         )
 
+        self._patch_accelerate_quanto()
+
         dispatched = dispatch_model(
             model,
             device_map=device_map,
