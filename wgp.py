@@ -4200,7 +4200,7 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         if compile_modules == False and len(compile):
             _load_models_info("Pytorch compilation is not supported for this Model")
         # kwargs["pinnedMemory"] = "text_encoder"
-        offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
+        if args.multigpu:\n            kwargs["asyncTransfers"] = False\n        offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
     if args.multigpu:
         multigpu_devices = [x.strip() for x in args.multigpu.split(",") if x.strip()]
         primary_multigpu = multigpu_devices[0]
