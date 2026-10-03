@@ -18,7 +18,7 @@ import torch
 
 
 class AccelerateMultiGPU:
-    def __init__(self, offload, devices: list[str], fraction: float = 0.82, verbose: int = 1):
+    def __init__(self, offload, devices: list[str], fraction: float = 0.92, verbose: int = 1):
         self.offload = offload
         self.devices = [torch.device(d) for d in devices]
         self.fraction = max(0.50, min(float(fraction), 0.98))
@@ -35,10 +35,20 @@ class AccelerateMultiGPU:
             print(f"[MultiGPU] {message}", flush=True)
 
     def _restore_mmgp_forwards(self, model):
+        # MMGP can wrap the same module more than once. Unwrap every MMGP
+        # residency wrapper before Accelerate gets control of the model.
         for module in model.modules():
-            previous = getattr(module, "_mm_forward", None)
-            if previous is not None:
+            seen = set()
+            while hasattr(module, "_mm_forward"):
+                previous = getattr(module, "_mm_forward", None)
+                if previous is None or id(previous) in seen:
+                    break
+                seen.add(id(previous))
                 module.forward = previous
+                try:
+                    delattr(module, "_mm_forward")
+                except AttributeError:
+                    break
 
             if hasattr(module, "_hf_hook"):
                 try:
@@ -54,20 +64,42 @@ class AccelerateMultiGPU:
             pass
 
     def _move_model_to_cpu(self, model):
-        self._remove_accelerate_hooks(model)
+        # Accelerate's hook detach path can try to materialize a meta Quanto
+        # tensor and fail. Restore MMGP's original CPU tensor references
+        # directly instead.
+        model_id = None
+        for candidate_id, candidate in self.offload.models.items():
+            if candidate is model:
+                model_id = candidate_id
+                break
+
         self._restore_mmgp_forwards(model)
 
-        try:
-            model.to("cpu")
-        except Exception:
-            for model_id, candidate in self.offload.models.items():
-                if candidate is model:
-                    for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules.get(model_id, []):
-                        if tied is not None:
-                            setattr(parent, name, getattr(tied[0], tied[1]))
-                        else:
-                            setattr(parent, name, source)
-                    break
+        if model_id is not None:
+            for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules.get(model_id, []):
+                try:
+                    if tied is not None:
+                        setattr(parent, name, getattr(tied[0], tied[1]))
+                    else:
+                        setattr(parent, name, source)
+                except Exception:
+                    pass
+
+        for module in model.modules():
+            if hasattr(module, "_hf_hook"):
+                try:
+                    delattr(module, "_hf_hook")
+                except AttributeError:
+                    pass
+
+        if hasattr(model, "hf_device_map"):
+            try:
+                delattr(model, "hf_device_map")
+            except AttributeError:
+                pass
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _available_ram(self):
         try:
@@ -90,21 +122,18 @@ class AccelerateMultiGPU:
         return 32 * 1024**3
 
     def _max_memory(self):
+        # CPU/disk entries are intentionally excluded. RAM remains MMGP's
+        # model-switch tier; Accelerate only shards the active model across
+        # the configured GPUs.
         max_memory = {}
-
-        for device in self.devices:
+        for no, device in enumerate(self.devices):
             index = device.index
             free, _ = torch.cuda.mem_get_info(index)
-            budget = int(free * self.fraction)
-            max_memory[index] = max(1, budget)
-
-        # This is critical. If CPU is absent from max_memory, Accelerate treats
-        # CPU as unavailable and assigns the remainder to "disk". dispatch_model
-        # then requires offload_dir and, more importantly, creates a disk tier
-        # instead of the requested RAM tier.
-        ram = self._available_ram()
-        max_memory["cpu"] = max(1, int(ram * 0.80))
-
+            share = self.fraction
+            if no == 0 and len(self.devices) > 1:
+                # GPU#0 also receives inputs and activations.
+                share *= 0.84
+            max_memory[index] = max(1, int(free * share))
         return max_memory
 
     def _no_split_classes(self, model):
@@ -222,28 +251,19 @@ class AccelerateMultiGPU:
         max_memory = self._max_memory()
 
         from accelerate import dispatch_model
-        from accelerate.utils import get_balanced_memory, infer_auto_device_map
+        from accelerate.utils import infer_auto_device_map
 
         no_split = self._no_split_classes(model)
 
-        # GPU#0 is also the execution/input/output device for WanGP. Do not
-        # balance Gemma evenly: Accelerate's low_zero mode reserves more
-        # headroom on the first GPU for inputs, outputs and temporary tensors.
-        balanced_memory = get_balanced_memory(
+        # Do not call get_balanced_memory(). It can deliberately reserve space
+        # for a CPU/disk tier. Here Accelerate is only the GPU sharder; MMGP
+        # remains responsible for RAM residency between model uses.
+        device_map = infer_auto_device_map(
             model,
             max_memory=max_memory,
             no_split_module_classes=no_split,
-            low_zero=True,
-        )
-
-        # Explicitly keep CPU as the last residency tier. There must never be
-        # a "disk" entry for normal MultiGPU operation.
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=balanced_memory,
-            no_split_module_classes=no_split,
             clean_result=True,
-            offload_buffers=True,
+            offload_buffers=False,
         )
 
         counts = {}
@@ -251,10 +271,12 @@ class AccelerateMultiGPU:
             key = str(device)
             counts[key] = counts.get(key, 0) + 1
 
-        if "disk" in counts:
+        invalid = [device for device in counts if device in {"cpu", "disk", "meta"}]
+        if invalid:
             raise RuntimeError(
-                f"Accelerate produced a disk device map for {model_id}: {device_map}. "
-                "MultiGPU requires GPU -> GPU -> CPU/RAM, not disk offload."
+                f"Accelerate could not fit {model_id} on the configured GPUs: "
+                f"{device_map}. CPU/disk dispatch is intentionally disabled; "
+                "increase the MultiGPU fraction or use a quantized checkpoint."
             )
 
         self._log(
@@ -288,6 +310,7 @@ class AccelerateMultiGPU:
             offload_buffers=False,
             force_hooks=True,
         )
+        dispatched.hf_device_map = device_map
 
         self.dispatched[model_id] = dispatched
         return dispatched
@@ -403,7 +426,7 @@ class AccelerateMultiGPU:
         return self
 
 
-def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
+def attach(offload, device_spec: str, fraction: float = 0.92, verbose: int = 1):
     devices = [part.strip() for part in str(device_spec or "").split(",") if part.strip()]
     normalized = [part if part.startswith("cuda:") else f"cuda:{part}" for part in devices]
 
