@@ -5,14 +5,13 @@ Accelerate owns the residency of an active model:
 
     GPU#0 -> GPU#1 -> ... -> CPU
 
-Unlike the old cache implementation, this does not copy an evicted block to a
-second GPU and then try to restore it later. The complete active model is
-dispatched once using Accelerate's device map, so a large model can actually
-execute with parameters resident on multiple GPUs.
+The active model is dispatched once using Accelerate's device map, allowing
+parameters to reside on multiple GPUs with CPU/RAM as the final tier.
 """
 from __future__ import annotations
 
 import gc
+import os
 import types
 
 import torch
@@ -36,17 +35,11 @@ class AccelerateMultiGPU:
             print(f"[MultiGPU] {message}", flush=True)
 
     def _restore_mmgp_forwards(self, model):
-        # MMGP wraps forwards with _mm_forward before profile() returns.
-        # Restore the wrapped function before Accelerate installs its own
-        # device hooks. This preserves MMGP LoRA wrappers, but removes the
-        # residency/offload checks that would otherwise fight Accelerate.
         for module in model.modules():
             previous = getattr(module, "_mm_forward", None)
             if previous is not None:
                 module.forward = previous
 
-            # MMGP installs a fake _hf_hook. Accelerate also uses this attribute,
-            # so the fake hook must not survive into dispatch_model.
             if hasattr(module, "_hf_hook"):
                 try:
                     delattr(module, "_hf_hook")
@@ -67,8 +60,6 @@ class AccelerateMultiGPU:
         try:
             model.to("cpu")
         except Exception:
-            # Some quantized modules do not implement .to(). Restore the
-            # original MMGP block tensors instead.
             for model_id, candidate in self.offload.models.items():
                 if candidate is model:
                     for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules.get(model_id, []):
@@ -78,24 +69,47 @@ class AccelerateMultiGPU:
                             setattr(parent, name, source)
                     break
 
+    def _available_ram(self):
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            pass
+
+        if os.name == "posix":
+            try:
+                page = os.sysconf("SC_PAGE_SIZE")
+                pages = os.sysconf("SC_AVPHYS_PAGES")
+                return int(page * pages)
+            except Exception:
+                pass
+
+        # Safe fallback: enough host memory for the final tier on typical
+        # WanGP systems. Accelerate will still fail explicitly if the OS
+        # cannot allocate it.
+        return 32 * 1024**3
+
     def _max_memory(self):
         max_memory = {}
+
         for device in self.devices:
             index = device.index
             free, _ = torch.cuda.mem_get_info(index)
             budget = int(free * self.fraction)
             max_memory[index] = max(1, budget)
 
-        # Do not cap CPU RAM here. Accelerate will use the currently available
-        # host memory and will only place weights there after GPU capacity is
-        # exhausted.
+        # This is critical. If CPU is absent from max_memory, Accelerate treats
+        # CPU as unavailable and assigns the remainder to "disk". dispatch_model
+        # then requires offload_dir and, more importantly, creates a disk tier
+        # instead of the requested RAM tier.
+        ram = self._available_ram()
+        max_memory["cpu"] = max(1, int(ram * 0.80))
+
         return max_memory
 
     def _no_split_classes(self, model):
         classes = list(getattr(model, "_no_split_modules", None) or [])
 
-        # Custom diffusion models often do not expose Transformers'
-        # _no_split_modules. Keep common transformer/residual blocks intact.
         common = {
             "BasicAVTransformerBlock",
             "BasicTransformerBlock",
@@ -121,6 +135,15 @@ class AccelerateMultiGPU:
         self._restore_mmgp_forwards(model)
         self._remove_accelerate_hooks(model)
 
+        # Gemma uses tied input/output embeddings. Accelerate warns about this
+        # when inferring a device map and may otherwise put lm_head on disk.
+        tie_weights = getattr(model, "tie_weights", None)
+        if callable(tie_weights):
+            try:
+                tie_weights()
+            except Exception:
+                pass
+
         max_memory = self._max_memory()
 
         from accelerate import dispatch_model
@@ -135,6 +158,8 @@ class AccelerateMultiGPU:
             low_zero=False,
         )
 
+        # Explicitly keep CPU as the last residency tier. There must never be
+        # a "disk" entry for normal MultiGPU operation.
         device_map = infer_auto_device_map(
             model,
             max_memory=balanced_memory,
@@ -143,12 +168,16 @@ class AccelerateMultiGPU:
             offload_buffers=True,
         )
 
-        # Make the map visible in the log. This is much more useful than
-        # pretending that a block was merely "cached" on GPU#1.
         counts = {}
         for device in device_map.values():
             key = str(device)
             counts[key] = counts.get(key, 0) + 1
+
+        if "disk" in counts:
+            raise RuntimeError(
+                f"Accelerate produced a disk device map for {model_id}: {device_map}. "
+                "MultiGPU requires GPU -> GPU -> CPU/RAM, not disk offload."
+            )
 
         self._log(
             f"{model_id}: Accelerate device map "
@@ -167,24 +196,19 @@ class AccelerateMultiGPU:
         return dispatched
 
     def load(self, model_id, blocks_name, preload=False):
-        # A dispatched model owns all of its internal blocks. MMGP must not
-        # subsequently pull individual blocks back to GPU#0.
         if blocks_name is not None:
             return
 
         model = self._dispatch(model_id)
         self.offload.loaded_blocks[model_id] = None
 
-        gpu_parts = []
-        for name, module in model.named_modules():
-            if not any(True for _ in module.parameters(recurse=False)):
-                continue
+        devices_used = set()
+        for module in model.modules():
             param = next(module.parameters(recurse=False), None)
             if param is not None:
-                gpu_parts.append((name or "<root>", str(param.device)))
+                devices_used.add(str(param.device))
 
-        devices_used = sorted(set(device for _, device in gpu_parts))
-        self._log(f"{model_id}: active on " + ", ".join(devices_used))
+        self._log(f"{model_id}: active on " + ", ".join(sorted(devices_used)))
 
     def unload(self, model_id, blocks_name):
         if blocks_name is not None:
@@ -217,9 +241,6 @@ class AccelerateMultiGPU:
         if model_id in getattr(obj, "active_models_ids", []):
             return
 
-        # Do not use MMGP's co-tenancy decision here. Two Accelerate-dispatched
-        # models can each legitimately occupy both GPUs, so keeping both alive
-        # defeats the purpose of the memory budget.
         self.unload_all()
 
         model = obj.models[model_id]
@@ -308,8 +329,6 @@ def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
         verbose=verbose,
     )
 
-    # MMGP's async prefetch and residency are incompatible with a static
-    # multi-device dispatch. Accelerate now owns model residency.
     if hasattr(offload, "async_transfers"):
         offload.async_transfers = False
 
@@ -320,7 +339,7 @@ def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
     offload.multigpu = manager
 
     for no, device in enumerate(manager.devices):
-        idx = manager._index(device) if hasattr(manager, "_index") else device.index
+        idx = device.index
         free, total = torch.cuda.mem_get_info(idx)
         manager._log(
             f"GPU#{no} cuda:{idx}: {free / 1024**3:.2f} GiB free / "
