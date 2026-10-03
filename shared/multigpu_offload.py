@@ -181,7 +181,7 @@ class TieredGPUOffload:
         # GPU, remove the model from the active set so ensure_model_loaded()
         # restores it before the next forward.
         if blocks_name is None and model_id in getattr(self.offload, "active_models_ids", []):
-            self.offload.active_models_ids.remove(model_id)
+            self.offload.active_models_ids = [active_id for active_id in self.offload.active_models_ids if active_id != model_id]
             self.offload.active_models = [
                 model for model in self.offload.active_models
                 if getattr(model, "_mm_id", None) != model_id
@@ -254,7 +254,7 @@ class TieredGPUOffload:
     def unload_all(self):
         if not self.installed:
             return
-        active_ids = list(getattr(self.offload, "active_models_ids", []) or [])
+        active_ids = list(dict.fromkeys(getattr(self.offload, "active_models_ids", []) or []))
         for model_id in active_ids:
             loaded = self.offload.loaded_blocks[model_id]
             if loaded is not None:
