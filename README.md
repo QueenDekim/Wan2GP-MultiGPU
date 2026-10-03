@@ -402,6 +402,32 @@ For detailed installation instructions for different GPU generations:
 For detailed installation instructions for different GPU generations:
 - **[Installation Guide](docs/AMD-INSTALLATION.md)** - Complete setup instructions for RDNA 4, 3, 3.5, and 2
 
+## 🖥️ Tiered MultiGPU Offload
+
+
+WanGP can keep MMGP model blocks across multiple NVIDIA GPUs instead of returning every evicted block directly to system RAM.
+
+The execution path is:
+
+`GPU#0 → GPU#1 → GPU#2 → ... → GPU#N → RAM`
+
+GPU#0 remains the active execution device. Secondary GPUs are used as an LRU cache for evicted MMGP blocks. A block is only returned to RAM after all configured secondary GPU tiers are full.
+
+Example with three GPUs:
+
+```bash
+python wgp.py --multigpu cuda:0,cuda:1,cuda:2
+```
+
+The first device is the active GPU. It can also be selected with `--gpu`, but when `--multigpu` is enabled it must match the first MultiGPU device.
+
+By default each secondary GPU may use up to 82% of its total VRAM for the tier cache. This can be changed with:
+
+```bash
+python wgp.py --multigpu cuda:0,cuda:1,cuda:2 --multigpu-cache-fraction 0.90
+```
+
+Without `--multigpu`, WanGP uses the normal MMGP single-GPU offload path.
 ## 🎯 Usage
 
 ### Basic Usage
