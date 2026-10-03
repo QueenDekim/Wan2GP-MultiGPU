@@ -98,10 +98,11 @@ class TieredGPUOffload:
 
         self.used[item.tier] -= item.size
         self.used[target_tier] += item.size
+        old_tier = item.tier
         item.tier = target_tier
         item.tensors = moved
         item.last_used = self.clock
-        self._log(f"{entry}: GPU#{item.tier} -> GPU#{target_tier + 1}")
+        self._log(f"{entry}: GPU#{old_tier + 1} -> GPU#{target_tier + 1}")
 
     def _ensure_capacity(self, tier, size, exclude=None):
         capacity = self._capacity(tier)
@@ -265,6 +266,7 @@ class TieredGPUOffload:
         self.offload.unload_all = self._original_unload_all
         self.offload.release = self._original_release
         self._release_cache()
+        self._original_release()
         self.installed = False
 
     def install(self):
