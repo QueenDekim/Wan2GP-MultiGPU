@@ -176,6 +176,17 @@ class TieredGPUOffload:
         if blocks_name is not None and blocks_name == self.offload.loaded_blocks[model_id]:
             self.offload.loaded_blocks[model_id] = None
 
+        # MMGP treats active_models_ids as proof that the model's base block
+        # is resident on GPU#0. If the base block is demoted to a secondary
+        # GPU, remove the model from the active set so ensure_model_loaded()
+        # restores it before the next forward.
+        if blocks_name is None and model_id in getattr(self.offload, "active_models_ids", []):
+            self.offload.active_models_ids.remove(model_id)
+            self.offload.active_models = [
+                model for model in self.offload.active_models
+                if getattr(model, "_mm_id", None) != model_id
+            ]
+
         if entry not in self.offload.blocks_of_modules:
             return
 
