@@ -315,6 +315,12 @@ def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
             raise ValueError(f"Invalid MultiGPU CUDA device: {device}")
     torch.cuda.set_device(torch.device(normalized[0]))
     manager = TieredGPUOffload(offload, normalized, fraction=fraction, verbose=verbose)
+
+    # MMGP preloading keeps extra blocks resident on GPU#0. That conflicts
+    # with tiered offload, where secondary GPUs are the persistent cache.
+    for model_id in getattr(offload, "preloaded_blocks_per_model", {}):
+        offload.preloaded_blocks_per_model[model_id] = []
+
     manager.install()
     offload.multigpu = manager
     return manager
