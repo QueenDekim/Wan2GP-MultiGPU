@@ -361,10 +361,11 @@ class AccelerateMultiGPU:
 
         # Keep Accelerate's standard dispatch path. It handles cross-device
         # activation transfers and tied-parameter bookkeeping.
+        main_device = self.devices[-1] if "cpu" in counts else self.devices[0]
         dispatched = dispatch_model(
             model,
             device_map=device_map,
-            main_device=self.devices[0],
+            main_device=main_device,
             offload_buffers=False,
             force_hooks=True,
         )
