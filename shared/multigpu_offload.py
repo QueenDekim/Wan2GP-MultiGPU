@@ -24,6 +24,10 @@ class AccelerateMultiGPU:
         self.fraction = max(0.50, min(float(fraction), 0.98))
         self.verbose = int(verbose)
         self.dispatched: dict[str, torch.nn.Module] = {}
+        # MMGP still owns the model's block registry and hooks.  While an
+        # active model is dispatched by Accelerate, its block registry must
+        # be empty so MMGP cannot silently pull a 1-2 GiB block back to GPU0.
+        self._suspended_mmgp_blocks: dict[str, object] = {}
         self.installed = False
 
     @property
@@ -63,6 +67,21 @@ class AccelerateMultiGPU:
         except ImportError:
             pass
 
+    def _suspend_mmgp_blocks(self, model_id):
+        if model_id in self._suspended_mmgp_blocks:
+            return
+        blocks = getattr(self.offload, "blocks_of_modules", {}).get(model_id)
+        if blocks is None:
+            return
+        self._suspended_mmgp_blocks[model_id] = blocks
+        self.offload.blocks_of_modules[model_id] = []
+        self._log(f"{model_id}: MMGP block loader suspended; Accelerate owns residency")
+
+    def _restore_mmgp_blocks(self, model_id):
+        blocks = self._suspended_mmgp_blocks.pop(model_id, None)
+        if blocks is not None:
+            self.offload.blocks_of_modules[model_id] = blocks
+
     def _move_model_to_cpu(self, model):
         # Accelerate's hook detach path can try to materialize a meta Quanto
         # tensor and fail. Restore MMGP's original CPU tensor references
@@ -75,8 +94,9 @@ class AccelerateMultiGPU:
 
         self._restore_mmgp_forwards(model)
 
+        original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
         if model_id is not None:
-            for parent, name, source, is_buffer, tied in self.offload.blocks_of_modules.get(model_id, []):
+            for parent, name, source, is_buffer, tied in (original_blocks or getattr(self.offload, "blocks_of_modules", {}).get(model_id, [])):
                 try:
                     if tied is not None:
                         setattr(parent, name, getattr(tied[0], tied[1]))
@@ -97,6 +117,9 @@ class AccelerateMultiGPU:
                 delattr(model, "hf_device_map")
             except AttributeError:
                 pass
+
+        if model_id is not None:
+            self._restore_mmgp_blocks(model_id)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -358,6 +381,11 @@ class AccelerateMultiGPU:
                     self._log(f"{model_id}: {name} -> {device_map[name]}")
 
         self._patch_accelerate_quanto()
+
+        # From this point until unload(), MMGP must not be allowed to perform
+        # its own RAM -> CUDA block transfers. The model is already owned by
+        # Accelerate and its parameters are placed by the device map.
+        self._suspend_mmgp_blocks(model_id)
 
         # Keep Accelerate's standard dispatch path. It handles cross-device
         # activation transfers and tied-parameter bookkeeping.
