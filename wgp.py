@@ -4203,10 +4203,14 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
     if args.multigpu:
         multigpu_devices = [x.strip() for x in args.multigpu.split(",") if x.strip()]
-        if args.gpu and args.gpu != multigpu_devices[0] and args.gpu != f"cuda:{multigpu_devices[0]}":
-            raise ValueError(f"--gpu ({args.gpu}) must match the first --multigpu device ({multigpu_devices[0]})")
-        if not args.gpu:
-            args.gpu = multigpu_devices[0]
+        primary_multigpu = multigpu_devices[0]
+        if not primary_multigpu.startswith("cuda:"):
+            primary_multigpu = f"cuda:{primary_multigpu}"
+        if args.gpu:
+            requested_gpu = args.gpu if args.gpu.startswith("cuda:") else f"cuda:{args.gpu}"
+            if requested_gpu != primary_multigpu:
+                raise ValueError(f"--gpu ({args.gpu}) must match the first --multigpu device ({primary_multigpu})")
+        args.gpu = primary_multigpu
         attach_multigpu(offloadobj, args.multigpu, fraction=args.multigpu_cache_fraction, verbose=int(verbose_level))
     offloadobj.tiny_vae = preview_decoder
     if len(args.gpu) > 0:
