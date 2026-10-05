@@ -28,6 +28,7 @@ class AccelerateMultiGPU:
         self._suspended_mmgp_blocks: dict[str, object] = {}
         self._suspended_mmgp_forwards: dict[str, list[tuple[torch.nn.Module, object]]] = {}
         self._original_tensor_backing: dict[str, list[tuple[torch.nn.Module, str, object, bool]]] = {}
+        self._jit_lora_hooks: dict[str, list[object]] = {}
         self.installed = False
 
     @property
@@ -239,6 +240,247 @@ class AccelerateMultiGPU:
             return param.device
         return None
 
+    def _profile_activation_reserve_bytes(self):
+        """Activation headroom selected from the primary (cuda:0) VRAM class."""
+        try:
+            _, total = torch.cuda.mem_get_info(self.devices[0].index)
+            gib = float(total) / 1024**3
+        except Exception:
+            gib = 16.0
+        if gib < 10.0:
+            reserve_gib = 1.25
+        elif gib < 14.0:
+            reserve_gib = 1.75
+        elif gib < 20.0:
+            reserve_gib = 2.50
+        else:
+            reserve_gib = 3.50
+        return int(reserve_gib * 1024**3)
+
+    @staticmethod
+    def _resolve_lora_source(shortcuts, adapter, value):
+        seen = set()
+        while isinstance(value, str):
+            if value in seen or "#" not in value:
+                return None
+            seen.add(value)
+            target, slot = value.rsplit("#", 1)
+            target_data = shortcuts.get(target)
+            if target_data is None or adapter not in target_data:
+                return None
+            try:
+                value = target_data[adapter][int(slot)]
+            except Exception:
+                return None
+        return value
+
+    def _lora_bytes_by_device(self, model, modules=None):
+        """Estimate exact persistent GPU LoRA bytes using full-residency semantics."""
+        active = list(getattr(model, "_loras_active_adapters", None) or [])
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not active or not loras_model_data:
+            return {}
+
+        shortcuts = getattr(model, "_loras_model_shortcuts", None) or {}
+        allowed = None if modules is None else {id(module) for module in modules}
+        seen = set()
+        totals = {}
+
+        for module, adapters in loras_model_data.items():
+            if allowed is not None and id(module) not in allowed:
+                continue
+            device = self._module_device(module)
+            if device is None or device.type != "cuda":
+                continue
+            key_device = str(device)
+            for adapter in active:
+                source = adapters.get(adapter)
+                if source is None:
+                    continue
+                for value in list(source)[:4]:
+                    value = self._resolve_lora_source(shortcuts, adapter, value)
+                    if not torch.is_tensor(value):
+                        continue
+                    key = (id(value), key_device)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    totals[key_device] = totals.get(key_device, 0) + self._tensor_nbytes(value)
+        return totals
+
+    def _move_loras_for_modules(self, model, modules, forced_device=None):
+        """Materialize active adapters for a selected module subset only."""
+        active = list(getattr(model, "_loras_active_adapters", None) or [])
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not active or not loras_model_data or not modules:
+            return 0, 0
+
+        shortcuts = getattr(model, "_loras_model_shortcuts", None) or {}
+        tensor_cache = {}
+        alias_cache = {}
+        moved_bytes = 0
+        moved_modules = 0
+
+        def move_tensor(item, device):
+            nonlocal moved_bytes
+            if item is None:
+                return None
+            if torch.is_tensor(item):
+                key = (id(item), str(device))
+                moved = tensor_cache.get(key)
+                if moved is None:
+                    with torch.cuda.device(device):
+                        moved = item.to(device, non_blocking=True)
+                    tensor_cache[key] = moved
+                    moved_bytes += self._tensor_nbytes(moved)
+                return moved
+            return item
+
+        def resolve_alias(value, adapter, device):
+            if not isinstance(value, str):
+                return move_tensor(value, device)
+            cache_key = (adapter, value, str(device))
+            if cache_key in alias_cache:
+                return alias_cache[cache_key]
+            resolved = self._resolve_lora_source(shortcuts, adapter, value)
+            resolved = move_tensor(resolved, device)
+            alias_cache[cache_key] = resolved
+            return resolved
+
+        for module in modules:
+            adapters = loras_model_data.get(module)
+            if not adapters:
+                continue
+            device = torch.device(forced_device) if forced_device is not None else self._module_device(module)
+            if device is None or device.type != "cuda":
+                continue
+            touched = False
+            for adapter in active:
+                source = adapters.get(adapter)
+                if source is None:
+                    continue
+                moved = list(source)
+                for slot in range(min(4, len(moved))):
+                    moved[slot] = resolve_alias(moved[slot], adapter, device)
+                adapters[adapter + "_GPU"] = moved
+                touched = True
+            if touched:
+                moved_modules += 1
+        return moved_modules, moved_bytes
+
+    @staticmethod
+    def _drop_loras_for_modules(model, modules):
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not loras_model_data:
+            return
+        for module in modules:
+            adapters = loras_model_data.get(module)
+            if not adapters:
+                continue
+            for key in [key for key in adapters if isinstance(key, str) and key.endswith("_GPU")]:
+                del adapters[key]
+
+    def _install_ltx2_jit_loras(self, model_id, model):
+        """Use one-transformer-block-at-a-time LoRA residency when VRAM is tight."""
+        active = list(getattr(model, "_loras_active_adapters", None) or [])
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        velocity_model = getattr(model, "velocity_model", None)
+        blocks = getattr(velocity_model, "transformer_blocks", None)
+        if not active or not loras_model_data or blocks is None or not len(blocks):
+            return False
+
+        full_bytes = self._lora_bytes_by_device(model)
+        if not full_bytes:
+            return False
+
+        reserve = self._profile_activation_reserve_bytes()
+        pressure = False
+        diagnostics = []
+        for device in self.devices:
+            free, _ = torch.cuda.mem_get_info(device.index)
+            lora_bytes = int(full_bytes.get(str(device), 0))
+            remaining = int(free) - lora_bytes
+            diagnostics.append(
+                f"{device}: full-LoRA={lora_bytes / 1024**3:.2f} GiB, "
+                f"post-LoRA-free={max(0, remaining) / 1024**3:.2f} GiB"
+            )
+            if lora_bytes and remaining < reserve:
+                pressure = True
+
+        if not pressure:
+            if self.verbose >= 2:
+                self._log(
+                    f"{model_id}: full LoRA residency fits activation reserve "
+                    f"({reserve / 1024**3:.2f} GiB); " + ", ".join(diagnostics)
+                )
+            return False
+
+        module_to_group = {}
+        groups = []
+        for block in blocks:
+            group = [
+                module
+                for module in self._iter_modules_unique(block)
+                if module in loras_model_data
+            ]
+            groups.append(group)
+            for module in group:
+                module_to_group[id(module)] = True
+
+        outside = [
+            module for module in loras_model_data
+            if id(module) not in module_to_group
+        ]
+        outside_modules, outside_bytes = self._move_loras_for_modules(model, outside)
+
+        handles = []
+        max_block_bytes = 0
+        grouped_modules = 0
+
+        for block, group in zip(blocks, groups):
+            if not group:
+                continue
+            grouped_modules += len(group)
+            group_bytes = sum(self._lora_bytes_by_device(model, group).values())
+            max_block_bytes = max(max_block_bytes, group_bytes)
+
+            # Capture each group by value: hooks are installed in a loop.
+            def pre_hook(_module, _inputs, group=tuple(group)):
+                device = None
+                for lora_module in group:
+                    device = self._module_device(lora_module)
+                    if device is not None and device.type == "cuda":
+                        break
+                if device is not None and device.type == "cuda":
+                    self._move_loras_for_modules(model, group, forced_device=device)
+
+            def post_hook(_module, _inputs, output, group=tuple(group)):
+                self._drop_loras_for_modules(model, group)
+                return output
+
+            handles.append(block.register_forward_pre_hook(pre_hook))
+            try:
+                handles.append(block.register_forward_hook(post_hook, always_call=True))
+            except TypeError:
+                handles.append(block.register_forward_hook(post_hook))
+
+        if not handles:
+            self._drop_loras_for_modules(model, outside)
+            return False
+
+        self._jit_lora_hooks[model_id] = handles
+        self._log(
+            f"{model_id}: LoRA block-JIT residency enabled for {grouped_modules} module(s) "
+            f"across {len(blocks)} block(s); full residency would violate "
+            f"{reserve / 1024**3:.2f} GiB activation reserve"
+        )
+        self._log(
+            f"{model_id}: JIT LoRA peak block ~{max_block_bytes / 1024**2:.1f} MiB; "
+            f"outside-block residency {outside_bytes / 1024**2:.1f} MiB "
+            f"({outside_modules} module(s)); " + ", ".join(diagnostics)
+        )
+        return True
+
     def _load_loras_for_dispatch(self, model_id, model):
         """Place active LoRA tensors beside each sharded base layer."""
         active = list(getattr(model, "_loras_active_adapters", None) or [])
@@ -313,6 +555,19 @@ class AccelerateMultiGPU:
             )
 
     def _unload_dispatched_loras(self, model):
+        model_id = None
+        for candidate_id, candidate in self.offload.models.items():
+            if candidate is model:
+                model_id = candidate_id
+                break
+
+        if model_id is not None:
+            for handle in self._jit_lora_hooks.pop(model_id, []):
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+
         loras_model_data = getattr(model, "_loras_model_data", None)
         if not loras_model_data:
             return
@@ -958,8 +1213,10 @@ class AccelerateMultiGPU:
             free, _ = torch.cuda.mem_get_info(device.index)
             free_now.append(int(free))
             budget = int(free * self.fraction)
-            reserve_gib = 1.50 if no == 0 else 0.75
-            budget -= int(reserve_gib * 1024**3)
+            # Reserve activation/workspace VRAM according to the primary GPU
+            # profile (8/12/16/24 GB). The same profile class governs all
+            # shards, while the actual free VRAM still weights each GPU.
+            budget -= self._profile_activation_reserve_bytes()
             if no == 0:
                 budget -= primary_support_bytes
             if no == len(self.devices) - 1:
@@ -1243,7 +1500,8 @@ class AccelerateMultiGPU:
                     force_hooks=True,
                 )
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
-            self._load_loras_for_dispatch(model_id, dispatched)
+            if not self._install_ltx2_jit_loras(model_id, dispatched):
+                self._load_loras_for_dispatch(model_id, dispatched)
             dispatched.hf_device_map = device_map
 
             # At this point the active stage is fully GPU-resident. The CPU
