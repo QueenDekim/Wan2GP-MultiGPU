@@ -651,6 +651,14 @@ class AccelerateMultiGPU:
         try:
             from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
         except Exception:
+            WeightQBytesTensor = ()
+
+        try:
+            from shared.qtypes.scaled_fp8 import ScaledFP8WeightTensor
+        except Exception:
+            ScaledFP8WeightTensor = ()
+
+        if WeightQBytesTensor == () and ScaledFP8WeightTensor == ():
             return
 
         import accelerate.hooks as accelerate_hooks
@@ -705,9 +713,20 @@ class AccelerateMultiGPU:
                 tensor_name = parts[-1]
 
             old_value = getattr(module, tensor_name)
-            if isinstance(old_value, WeightQBytesTensor):
+            special_types = tuple(
+                cls for cls in (WeightQBytesTensor, ScaledFP8WeightTensor)
+                if isinstance(cls, type)
+            )
+            if special_types and isinstance(old_value, special_types):
+                source = old_value
                 if value is not None:
-                    if not isinstance(value, WeightQBytesTensor):
+                    if isinstance(value, special_types):
+                        source = value
+                    else:
+                        # GPU-only dispatch normally moves the existing
+                        # wrapper in place. If Accelerate supplies a raw value
+                        # for a custom quantized wrapper, let the original path
+                        # handle it rather than guessing quantization metadata.
                         return original(
                             module, tensor_name, device, value=value, dtype=dtype,
                             fp16_statistics=fp16_statistics,
@@ -715,13 +734,21 @@ class AccelerateMultiGPU:
                             non_blocking=non_blocking,
                             clear_cache=clear_cache,
                         )
-                    new_value = value.to(device, non_blocking=non_blocking)
-                else:
-                    new_value = old_value.to(device, non_blocking=non_blocking)
 
+                target = torch.device(device)
+                if target.type == "cuda":
+                    with torch.cuda.device(target):
+                        new_value = source.to(target, non_blocking=non_blocking)
+                else:
+                    new_value = source.to(target, non_blocking=non_blocking)
+
+                # Do not reconstruct custom QTensor subclasses through
+                # param_cls(new_value): ScaledFP8WeightTensor and Quanto
+                # wrappers have metadata-rich constructors. Their .to()
+                # implementations preserve the wrapper and quantization data.
                 module._parameters[tensor_name] = new_value
-                if torch.device(device).type == "cuda":
-                    maybe_trim_dispatch_working_set(device)
+                if target.type == "cuda":
+                    maybe_trim_dispatch_working_set(target)
                     if clear_cache:
                         try:
                             torch.cuda.empty_cache()
@@ -746,7 +773,7 @@ class AccelerateMultiGPU:
             pass
 
         accelerate_hooks._wgp_quanto_patch = True
-        self._log("Accelerate Quanto compatibility enabled")
+        self._log("Accelerate quantized-tensor compatibility enabled (Quanto + scaled FP8)")
 
 
     def _gemma_device_map(self, model):
@@ -968,16 +995,31 @@ class AccelerateMultiGPU:
             ranges.append((start, end))
             start = end
 
-        # Parent mapping covers direct parameters such as scale_shift_table;
-        # more-specific child entries override it where required.
-        device_map = {"velocity_model": self.devices[0]}
+        # Never map the whole velocity_model root: Accelerate treats such
+        # an entry as place_submodules=True and would temporarily move the
+        # entire 19B tree to cuda:0 before child shard hooks are installed.
+        # Direct parameters/buffers are listed separately and pre-positioned
+        # before dispatch; real child modules receive explicit placements.
+        device_map = {}
         last_device = self.devices[-1]
+
+        for name, parameter in getattr(velocity_model, "_parameters", {}).items():
+            if parameter is None:
+                continue
+            device_map[f"velocity_model.{name}"] = (
+                last_device if name in output_param_names else self.devices[0]
+            )
+        for name, buffer in getattr(velocity_model, "_buffers", {}).items():
+            if buffer is None:
+                continue
+            device_map[f"velocity_model.{name}"] = self.devices[0]
 
         for child_name, child in getattr(velocity_model, "_modules", {}).items():
             if child is None or child_name == "transformer_blocks":
                 continue
-            if child_name in output_child_names:
-                device_map[f"velocity_model.{child_name}"] = last_device
+            device_map[f"velocity_model.{child_name}"] = (
+                last_device if child_name in output_child_names else self.devices[0]
+            )
 
         range_logs = []
         for device, (start, end) in zip(self.devices, ranges):
@@ -1005,6 +1047,52 @@ class AccelerateMultiGPU:
                 )
             )
         return device_map
+    def _preplace_direct_device_map_tensors(self, model, device_map):
+        """Place device-map entries that name direct parameters/buffers.
+
+        Accelerate validates parameter-name entries for coverage but only
+        installs execution hooks on actual submodules. LTX2 has a few direct
+        velocity_model parameters, so move those tiny tensors explicitly while
+        leaving every large child module to its own shard hook.
+        """
+        try:
+            import accelerate.utils.modeling as accelerate_modeling
+        except Exception:
+            return 0
+
+        try:
+            module_names = set(dict(model.named_modules()).keys())
+        except Exception:
+            module_names = set()
+
+        moved = 0
+        for path, device in device_map.items():
+            if not path or path in module_names or "." not in path:
+                continue
+            parent_path, tensor_name = path.rsplit(".", 1)
+            try:
+                parent = model.get_submodule(parent_path)
+            except Exception:
+                continue
+
+            is_parameter = tensor_name in getattr(parent, "_parameters", {})
+            is_buffer = tensor_name in getattr(parent, "_buffers", {})
+            if not is_parameter and not is_buffer:
+                continue
+
+            accelerate_modeling.set_module_tensor_to_device(
+                parent,
+                tensor_name,
+                device,
+                non_blocking=True,
+                clear_cache=False,
+            )
+            moved += 1
+
+        if moved and self.verbose >= 2:
+            self._log(f"pre-positioned {moved} direct parameter/buffer device-map tensor(s)")
+        return moved
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -1100,6 +1188,7 @@ class AccelerateMultiGPU:
                     self._log(f"{model_id}: {name} -> {device_map[name]}")
 
         self._patch_accelerate_quanto()
+        self._preplace_direct_device_map_tensors(model, device_map)
 
         # From this point until unload(), MMGP must not be allowed to perform
         # its own RAM -> CUDA block transfers. The model is already owned by
@@ -1113,13 +1202,20 @@ class AccelerateMultiGPU:
         # activation transfers and tied-parameter bookkeeping.
         main_device = device_map.get("model.embed_tokens", self.devices[0])
         try:
-            dispatched = dispatch_model(
-                model,
-                device_map=device_map,
-                main_device=main_device,
-                offload_buffers=False,
-                force_hooks=True,
-            )
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"The following device_map keys do not match any submodules in the model:.*",
+                    category=UserWarning,
+                )
+                dispatched = dispatch_model(
+                    model,
+                    device_map=device_map,
+                    main_device=main_device,
+                    offload_buffers=False,
+                    force_hooks=True,
+                )
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
             self._load_loras_for_dispatch(model_id, dispatched)
             dispatched.hf_device_map = device_map
