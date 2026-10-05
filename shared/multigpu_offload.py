@@ -111,6 +111,29 @@ class AccelerateMultiGPU:
                 pass
         self._log(f"{model_id}: restored {len(saved)} MMGP forward hook(s)")
 
+    def _sanitize_accelerate_old_forwards(self, model_id, model):
+        """Ensure Accelerate never calls back into an MMGP wrapper."""
+        fixed = 0
+        for module in model.modules():
+            old_forward = getattr(module, "_old_forward", None)
+            if not callable(old_forward):
+                continue
+            current = old_forward
+            seen = set()
+            while callable(current) and id(current) not in seen:
+                seen.add(id(current))
+                previous = self._mmgp_wrapper_target(current, module)
+                if previous is None:
+                    break
+                current = previous
+                fixed += 1
+            if current is not old_forward:
+                module._old_forward = current
+        if fixed:
+            self._log(f"{model_id}: removed {fixed} nested MMGP hook(s) from Accelerate _old_forward")
+        elif self.verbose >= 2:
+            self._log(f"{model_id}: Accelerate _old_forward verified clean of MMGP hooks")
+
     def _remove_accelerate_hooks(self, model):
         try:
             from accelerate.hooks import remove_hook_from_submodules
@@ -479,6 +502,7 @@ class AccelerateMultiGPU:
                 offload_buffers=False,
                 force_hooks=True,
             )
+            self._sanitize_accelerate_old_forwards(model_id, dispatched)
             dispatched.hf_device_map = device_map
         except Exception:
             # Never leave MMGP with a disabled block registry if Accelerate
