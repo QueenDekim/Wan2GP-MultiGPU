@@ -68,13 +68,55 @@ class GemmaFeaturesExtractorProjLinear(torch.nn.Module, ModelConfigurator["Gemma
     def is_v2(self) -> bool:
         return self.video_aggregate_embed is not None
 
+    def _projection_device(self) -> torch.device:
+        """Return the CUDA device that owns the active projection weights.
+
+        With Accelerate MultiGPU, Gemma hidden states are produced on the GPU
+        that owns each decoder layer. The feature extractor, however, flattens
+        all 49 states into one vector and therefore requires them on one device.
+        Gather activations to the projection weight's device, never to a
+        hard-coded cuda:0.
+        """
+        for projection in (
+            self.video_aggregate_embed,
+            self.aggregate_embed,
+            self.audio_aggregate_embed,
+        ):
+            if projection is None:
+                continue
+            weight = getattr(projection, "weight", None)
+            device = getattr(weight, "device", None)
+            if device is not None and torch.device(device).type != "meta":
+                return torch.device(device)
+        return torch.device("cuda", torch.cuda.current_device())
+
     def forward(
         self,
         hidden_states: tuple[torch.Tensor, ...] | torch.Tensor,
         attention_mask: torch.Tensor,
         padding_side: str = "left",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        encoded = torch.stack(hidden_states, dim=-1) if isinstance(hidden_states, (list, tuple)) else hidden_states
+        target_device = self._projection_device()
+        attention_mask = attention_mask.to(target_device, non_blocking=True)
+
+        if isinstance(hidden_states, (list, tuple)):
+            # Decoder-layer outputs follow the Gemma shard placement, so a
+            # tuple can legitimately contain tensors from cuda:0, cuda:1, ...
+            # Only activations are gathered here; model weights remain sharded.
+            gathered = [
+                state if state.device == target_device
+                else state.to(target_device, non_blocking=True)
+                for state in hidden_states
+            ]
+            encoded = torch.stack(gathered, dim=-1)
+            del gathered
+        else:
+            encoded = (
+                hidden_states
+                if hidden_states.device == target_device
+                else hidden_states.to(target_device, non_blocking=True)
+            )
+
         if self.is_v2:
             normed = _norm_and_concat_per_token_rms(encoded, attention_mask).to(encoded.dtype)
             v_dim = self.video_aggregate_embed.out_features
