@@ -228,6 +228,68 @@ class AccelerateMultiGPU:
             for key in [key for key in adapters if isinstance(key, str) and key.endswith("_GPU")]:
                 del adapters[key]
 
+    def _trim_host_working_set(self, reason=""):
+        """Return inactive CPU/MMAP pages to Windows immediately.
+
+        GPU-first dispatch necessarily reads the CPU backing tensors once while
+        copying them to CUDA. On Windows those file-backed pages remain in this
+        process' working set and can consume essentially all physical RAM even
+        though the active model no longer needs them on CPU. EmptyWorkingSet
+        evicts those inactive pages without dropping the mmap/backing objects,
+        so MMGP can fault them back in later when another stage needs them.
+        """
+        if os.name != "nt":
+            return
+
+        gc.collect()
+        before = after = None
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            before = process.memory_info().rss
+        except Exception:
+            process = None
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            get_current_process = kernel32.GetCurrentProcess
+            get_current_process.restype = wintypes.HANDLE
+            empty_working_set = psapi.EmptyWorkingSet
+            empty_working_set.argtypes = [wintypes.HANDLE]
+            empty_working_set.restype = wintypes.BOOL
+
+            handle = get_current_process()
+            if not empty_working_set(handle):
+                if self.verbose >= 2:
+                    self._log(
+                        f"Windows working-set trim failed ({ctypes.get_last_error()})"
+                    )
+                return
+        except Exception as exc:
+            if self.verbose >= 2:
+                self._log(f"Windows working-set trim unavailable: {exc}")
+            return
+
+        if process is not None:
+            try:
+                after = process.memory_info().rss
+            except Exception:
+                pass
+
+        if self.verbose >= 1:
+            suffix = f" after {reason}" if reason else ""
+            if before is not None and after is not None:
+                self._log(
+                    f"Host working set trimmed{suffix}: "
+                    f"{before / 1024**3:.2f} -> {after / 1024**3:.2f} GiB"
+                )
+            else:
+                self._log(f"Host working set trimmed{suffix}")
+
     def _remove_accelerate_hooks(self, model):
         try:
             from accelerate.hooks import remove_hook_from_submodules
@@ -302,6 +364,9 @@ class AccelerateMultiGPU:
 
         gc.collect()
         torch.cuda.empty_cache()
+        self._trim_host_working_set(
+            f"{model_id} unload" if model_id is not None else "model unload"
+        )
 
     def _available_ram(self):
         try:
@@ -601,6 +666,11 @@ class AccelerateMultiGPU:
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
             self._load_loras_for_dispatch(model_id, dispatched)
             dispatched.hf_device_map = device_map
+
+            # At this point the active stage is fully GPU-resident. The CPU
+            # originals are only backing storage, so evict their touched pages
+            # now instead of waiting until the stage finishes.
+            self._trim_host_working_set(f"{model_id} GPU dispatch")
         except Exception:
             # Never leave MMGP with a disabled block registry if Accelerate
             # fails during dispatch.
