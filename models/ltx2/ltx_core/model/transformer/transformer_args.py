@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from collections.abc import Callable
 
@@ -48,6 +48,39 @@ class TransformerArgs:
     prompt_timestep: torch.Tensor | None = None
     self_attention_mask: torch.Tensor | None = None
     ref_context: torch.Tensor | None = None
+
+    def to(self, device, non_blocking: bool = False):
+        """Move tensor payloads when Accelerate crosses a GPU shard boundary."""
+        device = torch.device(device)
+
+        def move(value):
+            if torch.is_tensor(value):
+                if value.device == device:
+                    return value
+                return value.to(device=device, non_blocking=non_blocking)
+            if isinstance(value, dict):
+                return {key: move(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [move(item) for item in value]
+            if isinstance(value, tuple) and not isinstance(value, RopeCache):
+                return type(value)(move(item) for item in value)
+            return value
+
+        return replace(
+            self,
+            x=move(self.x),
+            context=move(self.context),
+            context_mask=move(self.context_mask),
+            timesteps=move(self.timesteps),
+            embedded_timestep=move(self.embedded_timestep),
+            cross_scale_shift_timestep=move(self.cross_scale_shift_timestep),
+            cross_gate_timestep=move(self.cross_gate_timestep),
+            cross_attention_mask=move(self.cross_attention_mask),
+            nag=move(self.nag),
+            prompt_timestep=move(self.prompt_timestep),
+            self_attention_mask=move(self.self_attention_mask),
+            ref_context=move(self.ref_context),
+        )
 
 
 @dataclass(frozen=True)
