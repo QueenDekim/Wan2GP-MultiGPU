@@ -535,7 +535,10 @@ def postprocess_text_embeddings(
     """
     projected = []
     for item in embeddings:
-        attention_mask = item.attention_mask.to("cuda")
+        # The projection may live on any CUDA shard. Keep the mask colocated
+        # with the gathered hidden states instead of forcing cuda:0.
+        projection_device = feature_extractor_linear._projection_device()
+        attention_mask = item.attention_mask.to(projection_device, non_blocking=True)
         encoded_video_input, encoded_audio_input = _apply_feature_extractor(
             item.hidden_states,
             attention_mask,
