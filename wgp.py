@@ -8390,7 +8390,7 @@ def generate_media(
                 if isinstance(e, (DownloadCancelled, DownloadError, MediaProcessingAborted)):
                     raise
                 s = str(e)
-                keyword_list = {"CUDA out of memory" : "VRAM", "Tried to allocate":"VRAM", "CUDA error: out of memory": "RAM", "CUDA error: too many resources requested": "RAM"}
+                keyword_list = {"CUDA out of memory" : "VRAM", "Tried to allocate":"VRAM", "CUDA error: out of memory": "VRAM", "CUDA error: too many resources requested": "VRAM"}
                 crash_type = ""
                 for keyword, tp  in keyword_list.items():
                     if keyword in s:
