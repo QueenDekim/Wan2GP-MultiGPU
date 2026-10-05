@@ -58,6 +58,8 @@ class TransformerArgs:
                 if value.device == device:
                     return value
                 return value.to(device=device, non_blocking=non_blocking)
+            if isinstance(value, RopeCache):
+                return value.to(device=device, non_blocking=non_blocking)
             if isinstance(value, dict):
                 return {key: move(item) for key, item in value.items()}
             if isinstance(value, list):
@@ -73,6 +75,8 @@ class TransformerArgs:
             context_mask=move(self.context_mask),
             timesteps=move(self.timesteps),
             embedded_timestep=move(self.embedded_timestep),
+            positional_embeddings=move(self.positional_embeddings),
+            cross_positional_embeddings=move(self.cross_positional_embeddings),
             cross_scale_shift_timestep=move(self.cross_scale_shift_timestep),
             cross_gate_timestep=move(self.cross_gate_timestep),
             cross_attention_mask=move(self.cross_attention_mask),
