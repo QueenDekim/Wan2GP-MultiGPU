@@ -159,7 +159,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Configuration Tab"
-        self.version = "1.1.6"
+        self.version = "1.1.7"
         self.description = "Lets you adjust all your performance and UI options for WAN2GP"
 
     def setup_ui(self):
@@ -183,6 +183,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_global("attention_modes_supported")
         self.request_global("displayed_model_types")
         self.request_global("memory_profile_choices")
+        self.request_global("standard_memory_profile_choices")
+        self.request_global("multigpu_memory_profile_choices")
+        self.request_global("multigpu_auto_profile")
         self.request_global("attention_modes_choices")
         self.request_global("save_path")
         self.request_global("image_save_path")
@@ -223,6 +226,86 @@ class ConfigTabPlugin(WAN2GPPlugin):
             label="Configuration",
             component_constructor=self.create_config_ui,
         )
+
+    @staticmethod
+    def _profile_choice_value(value, allowed, fallback):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return value if value in allowed else fallback
+
+    def _memory_profile_ui_state(self):
+        """Return mode-specific profile choices and persisted UI values."""
+        if bool(getattr(self.args, "multigpu", "")):
+            explicit = list(getattr(self, "multigpu_memory_profile_choices", None) or [])
+            if not explicit:
+                # Compatibility fallback for older injected globals.
+                explicit = list(getattr(self, "memory_profile_choices", None) or [])
+
+            auto_profile = getattr(self, "multigpu_auto_profile", None)
+            try:
+                auto_profile = float(auto_profile)
+            except (TypeError, ValueError):
+                auto_profile = float(getattr(self, "default_profile_video", 16.0))
+
+            primary_vram = float(getattr(self.args, "multigpu_primary_vram_gib", 0.0) or 0.0)
+            auto_name = "24 GB+ Primary" if auto_profile >= 24 else f"{auto_profile:g} GB Primary"
+            choices = [
+                (
+                    f"MultiGPU Auto: cuda:0 {primary_vram:.2f} GiB -> {auto_name}",
+                    -1.0,
+                )
+            ] + explicit
+            allowed = {float(value) for _, value in choices}
+
+            def stored(kind):
+                return self._profile_choice_value(
+                    self.server_config.get(f"multigpu_{kind}_profile", -1.0),
+                    allowed,
+                    -1.0,
+                )
+
+            return (
+                choices,
+                stored("video"),
+                stored("image"),
+                stored("audio"),
+                "Default MultiGPU Memory Profile",
+            )
+
+        choices = list(getattr(self, "standard_memory_profile_choices", None) or [])
+        if not choices:
+            choices = list(getattr(self, "memory_profile_choices", None) or [])
+        allowed = {float(value) for _, value in choices}
+
+        def stored(kind, fallback):
+            return self._profile_choice_value(
+                self.server_config.get(f"{kind}_profile", fallback),
+                allowed,
+                float(fallback),
+            )
+
+        return (
+            choices,
+            stored("video", self.default_profile_video),
+            stored("image", self.default_profile_image),
+            stored("audio", self.default_profile_audio),
+            "Default Memory Profile",
+        )
+
+    def _resolve_runtime_profile(self, value):
+        """Resolve MultiGPU Auto (-1) to the detected cuda:0 profile."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = -1.0
+        if bool(getattr(self.args, "multigpu", "")) and value < 0:
+            try:
+                return float(self.multigpu_auto_profile)
+            except (TypeError, ValueError):
+                return float(self.default_profile_video)
+        return value
 
     def create_config_ui(self):
         first_event = len(gr.context.get_blocks_context().fns)
@@ -387,20 +470,27 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.boost_choice = gr.Dropdown(choices=[("ON", 1), ("OFF", 2)], value=self.boost, label="Boost (~10% speedup for ~1GB VRAM)")
                     self.int8_kernels_choice = gr.Dropdown(choices=int8_backend.CHOICES, value=self.server_config.get("int8_kernels", "auto"), label="INT8 Math Kernels", info="Auto selects Comfy Kitchen, then Triton, then PyTorch. Disabled uses PyTorch. Changes apply to the next generation without reloading weights.")
                     self.kernel_precision_choice = gr.Dropdown(choices=kernel_policy.CHOICES, value=self.server_config.get("kernel_precision", "fast"), label="CUDA Kernels Optimized Ops Precision (When Available)", info="Fast allows additional VAE optimizations with small rounding differences. Allow Faster Approximate Kernels is the default. INT8 math is controlled separately.")
+                    (
+                        active_memory_profile_choices,
+                        video_profile_value,
+                        image_profile_value,
+                        audio_profile_value,
+                        memory_profile_label,
+                    ) = self._memory_profile_ui_state()
                     self.video_profile_choice = gr.Dropdown(
-                        choices=self.memory_profile_choices,
-                        value=self.default_profile_video,
-                        label="Default Memory Profile (Video)",
+                        choices=active_memory_profile_choices,
+                        value=video_profile_value,
+                        label=f"{memory_profile_label} (Video)",
                     )
                     self.image_profile_choice = gr.Dropdown(
-                        choices=self.memory_profile_choices,
-                        value=self.default_profile_image,
-                        label="Default Memory Profile (Image)",
+                        choices=active_memory_profile_choices,
+                        value=image_profile_value,
+                        label=f"{memory_profile_label} (Image)",
                     )
                     self.audio_profile_choice = gr.Dropdown(
-                        choices=self.memory_profile_choices,
-                        value=self.default_profile_audio,
-                        label="Default Memory Profile (Audio)",
+                        choices=active_memory_profile_choices,
+                        value=audio_profile_value,
+                        label=f"{memory_profile_label} (Audio)",
                     )
                     self.preload_in_VRAM_choice = gr.Slider(0, 40000, value=self.server_config.get("preload_in_VRAM", 0), step=100, label="VRAM (MB) for Preloaded Models (0=profile default)")
                     self.max_reserved_loras_choice = gr.Slider(
@@ -1021,8 +1111,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
             "image_save_path": image_save_path_choice, "audio_save_path": audio_save_path_choice,
             "lm_decoder_engine": lm_decoder_engine_choice,
-            "compile": compile_choice, "profile": video_profile_choice,
-            "video_profile": video_profile_choice, "image_profile": image_profile_choice, "audio_profile": audio_profile_choice,
+            "compile": compile_choice,
             "vae_config": vae_config_choice, "vae_precision": VAE_precision_choice,
             "mixed_precision": mixed_precision_choice, "metadata_type": metadata_choice,
             "transformer_quantization": quantization_choice, "transformer_dtype_policy": transformer_dtype_policy_choice,
@@ -1060,6 +1149,35 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "embed_source_images": embed_source_images_choice,
             "video_container": video_container_choice,
         })
+
+        if bool(getattr(self.args, "multigpu", "")):
+            allowed_profiles = {-1.0, 8.0, 12.0, 16.0, 24.0}
+            video_profile_choice = self._profile_choice_value(video_profile_choice, allowed_profiles, -1.0)
+            image_profile_choice = self._profile_choice_value(image_profile_choice, allowed_profiles, -1.0)
+            audio_profile_choice = self._profile_choice_value(audio_profile_choice, allowed_profiles, -1.0)
+            new_server_config.update({
+                "multigpu_video_profile": video_profile_choice,
+                "multigpu_image_profile": image_profile_choice,
+                "multigpu_audio_profile": audio_profile_choice,
+            })
+        else:
+            allowed_profiles = {1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0}
+            video_profile_choice = self._profile_choice_value(
+                video_profile_choice, allowed_profiles, float(self.default_profile_video)
+            )
+            image_profile_choice = self._profile_choice_value(
+                image_profile_choice, allowed_profiles, float(self.default_profile_image)
+            )
+            audio_profile_choice = self._profile_choice_value(
+                audio_profile_choice, allowed_profiles, float(self.default_profile_audio)
+            )
+            new_server_config.update({
+                "profile": video_profile_choice,
+                "video_profile": video_profile_choice,
+                "image_profile": image_profile_choice,
+                "audio_profile": audio_profile_choice,
+            })
+
         # Preserve saved values for controls hidden by the selected engine or Deepy mode.
         if not deepy_remote:
             new_server_config.update({
@@ -1152,10 +1270,19 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         self.set_global("three_levels_hierarchy", new_server_config["model_hierarchy_type"] == 1)
         self.set_global("attention_mode", new_server_config["attention_mode"])
-        self.set_global("default_profile", new_server_config["profile"])
-        self.set_global("default_profile_video", new_server_config["video_profile"])
-        self.set_global("default_profile_image", new_server_config["image_profile"])
-        self.set_global("default_profile_audio", new_server_config["audio_profile"])
+        if bool(getattr(self.args, "multigpu", "")):
+            runtime_video_profile = self._resolve_runtime_profile(new_server_config.get("multigpu_video_profile", -1.0))
+            runtime_image_profile = self._resolve_runtime_profile(new_server_config.get("multigpu_image_profile", -1.0))
+            runtime_audio_profile = self._resolve_runtime_profile(new_server_config.get("multigpu_audio_profile", -1.0))
+            self.set_global("default_profile", runtime_video_profile)
+            self.set_global("default_profile_video", runtime_video_profile)
+            self.set_global("default_profile_image", runtime_image_profile)
+            self.set_global("default_profile_audio", runtime_audio_profile)
+        else:
+            self.set_global("default_profile", new_server_config["profile"])
+            self.set_global("default_profile_video", new_server_config["video_profile"])
+            self.set_global("default_profile_image", new_server_config["image_profile"])
+            self.set_global("default_profile_audio", new_server_config["audio_profile"])
         self.set_global("compile", new_server_config["compile"])
         self.set_global("text_encoder_quantization", new_server_config["text_encoder_quantization"])
         self.set_global("lm_decoder_engine", new_server_config["lm_decoder_engine"])
@@ -1177,7 +1304,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
         deepy_prime_mcp_servers_changed = DEEPY_PRIME_MCP_SERVERS_KEY in changes or DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY in changes
         deepy_file_access_changed = any(key in changes for key in (DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, "save_path", "image_save_path", "audio_save_path"))
         speculative_decoding_changed = PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY in changes
-        enhancer_profile_changed = "profile" in changes or "video_profile" in changes
+        enhancer_profile_changed = any(
+            key in changes
+            for key in ("profile", "video_profile", "multigpu_video_profile")
+        )
         chat_event_update = gr.update()
         if enhancer_runtime_changed:
             session = get_or_create_assistant_session(state)
