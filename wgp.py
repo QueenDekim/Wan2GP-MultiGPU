@@ -2579,6 +2579,7 @@ args = parse_wgp_args(CONFIG_FILENAME)
 
 def _resolve_multigpu_runtime(args):
     """Normalize MultiGPU CLI state and auto-select every visible CUDA GPU."""
+    args.multigpu_primary_vram_gib = 0.0
     requested = str(getattr(args, "multigpu", "") or "").strip()
     lowered = requested.lower()
     if is_mps or not torch.cuda.is_available():
@@ -2638,6 +2639,9 @@ def _resolve_multigpu_runtime(args):
         args.gpu = devices[0]
     total_vram = sum(torch.cuda.get_device_properties(d).total_memory for d in devices)
     args.multigpu_total_vram_gib = total_vram / 1024**3
+    args.multigpu_primary_vram_gib = (
+        torch.cuda.get_device_properties(devices[0]).total_memory / 1024**3
+    )
 
     print(
         f"[MultiGPU] Auto GPU set: {args.multigpu} "
@@ -3490,23 +3494,108 @@ if len(args.attention)> 0:
     else:
         raise Exception(f"Unknown attention mode '{args.attention}'")
 
+STANDARD_WAN2GP_PROFILE_VALUES = {1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0}
+
+# MultiGPU profiles are intentionally separate from Wan2GP's standard profiles.
+# The profile class is selected from the PRIMARY GPU only. Secondary cards may
+# have any VRAM size; Accelerate still weights them by their actual free VRAM.
+MULTIGPU_PROFILE_CONFIGS = {
+    8.0: {
+        "name": "8 GB Primary",
+        "cache_fraction": 0.82,
+        "registry_budget_mb": 512,
+        "stage_budget_mb": 64,
+        "description": "maximum activation headroom for 8 GB primary GPUs",
+    },
+    12.0: {
+        "name": "12 GB Primary",
+        "cache_fraction": 0.87,
+        "registry_budget_mb": 768,
+        "stage_budget_mb": 96,
+        "description": "conservative sharding for 12 GB primary GPUs",
+    },
+    16.0: {
+        "name": "16 GB Primary",
+        "cache_fraction": 0.92,
+        "registry_budget_mb": 1024,
+        "stage_budget_mb": 128,
+        "description": "balanced sharding for 16 GB primary GPUs",
+    },
+    24.0: {
+        "name": "24 GB+ Primary",
+        "cache_fraction": 0.96,
+        "registry_budget_mb": 1536,
+        "stage_budget_mb": 192,
+        "description": "aggressive GPU residency for 24 GB or larger primary GPUs",
+    },
+}
+
+def _multigpu_profile_class(primary_vram_gib):
+    primary_vram_gib = float(primary_vram_gib or 0.0)
+    # Boundaries are midway between the supported nominal VRAM classes.
+    # This maps real capacities such as 7.9/11.9/15.9/23.7 GiB correctly.
+    if primary_vram_gib < 10.0:
+        return 8.0
+    if primary_vram_gib < 14.0:
+        return 12.0
+    if primary_vram_gib < 20.0:
+        return 16.0
+    return 24.0
+
 def _multigpu_auto_profile():
     if not args.multigpu:
         return None
-    total_vram = float(getattr(args, "multigpu_total_vram_gib", 0.0))
-    # 3.5 = high-VRAM behavior without reserved/pinned host-memory copies.
-    # Below ~24 GiB aggregate VRAM keep the low-VRAM scheduling fallback.
-    return 3.5 if total_vram >= 24.0 else 4.5
+    return _multigpu_profile_class(
+        getattr(args, "multigpu_primary_vram_gib", 0.0)
+    )
+
+def _multigpu_profile_config(profile=None):
+    try:
+        profile = float(profile)
+    except (TypeError, ValueError):
+        profile = -1.0
+    if profile not in MULTIGPU_PROFILE_CONFIGS:
+        profile = _multigpu_auto_profile()
+    return MULTIGPU_PROFILE_CONFIGS[float(profile)]
+
+def _normalize_profile_override(profile, *, multigpu=None):
+    enabled = bool(args.multigpu) if multigpu is None else bool(multigpu)
+    try:
+        value = float(profile)
+    except (TypeError, ValueError):
+        return -1.0
+    if value == -1.0:
+        return -1.0
+    allowed = MULTIGPU_PROFILE_CONFIGS if enabled else STANDARD_WAN2GP_PROFILE_VALUES
+    return value if value in allowed else -1.0
 
 multigpu_auto_profile = _multigpu_auto_profile()
+
+if args.multigpu and force_profile_no >= 0:
+    normalized_force_profile = _normalize_profile_override(force_profile_no, multigpu=True)
+    if normalized_force_profile < 0:
+        print(
+            f"[MultiGPU] Ignoring standard/unknown --profile {force_profile_no:g}; "
+            "valid MultiGPU profiles are 8, 12, 16 and 24. Using automatic profile.",
+            flush=True,
+        )
+        force_profile_no = -1
+    else:
+        force_profile_no = normalized_force_profile
+
 default_profile_video = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["video_profile"])
 default_profile_image = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["image_profile"])
 default_profile_audio = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["audio_profile"])
 default_profile = default_profile_video
 if multigpu_auto_profile is not None:
+    primary_vram = float(getattr(args, "multigpu_primary_vram_gib", 0.0))
+    total_vram = float(getattr(args, "multigpu_total_vram_gib", 0.0))
+    selected_profile = default_profile_video
+    selected_cfg = _multigpu_profile_config(selected_profile)
     print(
-        f"[MultiGPU] Automatic WGP memory profile: {multigpu_auto_profile} "
-        f"for {getattr(args, 'multigpu_total_vram_gib', 0.0):.2f} GiB aggregate VRAM",
+        f"[MultiGPU] Memory profile: {selected_cfg['name']} "
+        f"(cuda:0/profile primary={primary_vram:.2f} GiB, aggregate={total_vram:.2f} GiB, "
+        f"VRAM fraction={selected_cfg['cache_fraction']:.2f})",
         flush=True,
     )
 loaded_profile = force_profile_no = -1
@@ -3997,7 +4086,8 @@ def get_default_profile(output_type):
     return default_profile_video
 
 def compute_profile(override_profile, output_type="video"):
-    return override_profile if override_profile != -1 else get_default_profile(output_type)
+    normalized = _normalize_profile_override(override_profile)
+    return normalized if normalized != -1 else get_default_profile(output_type)
 
 def get_profile_type_for_model(model_type, image_mode=0):
     model_def = get_model_def(model_type)
@@ -4021,20 +4111,19 @@ def init_pipe(pipe, kwargs, profile):
         kwargs["budgets"] = source_budgets = {}
 
     if args.multigpu:
-        # MultiGPU profile: Accelerate owns active-model CUDA residency across
-        # all cards. MMGP must not pre-stage/pin large copies in system RAM or
-        # consume a large hidden budget on GPU#0 before Accelerate dispatch.
+        # MultiGPU profiles are GPU-first variants. MMGP only retains a small
+        # registry/backing budget; Accelerate owns active-model residency.
+        cfg = _multigpu_profile_config(profile)
         mmgp_profile = 3
-        primary = torch.device(args.multigpu.split(",")[0])
-        primary_total_mb = torch.cuda.get_device_properties(primary).total_memory // (1024**2)
-        registry_budget_mb = max(768, min(2048, int(primary_total_mb * 0.10)))
+        registry_budget_mb = int(cfg["registry_budget_mb"])
+        stage_budget_mb = int(cfg["stage_budget_mb"])
         source_budgets.update({
-            "transformer": 128 if preload == 0 else min(preload, registry_budget_mb),
-            "text_encoder": 128 if preload == 0 else min(preload, registry_budget_mb),
+            "transformer": stage_budget_mb if preload == 0 else min(preload, registry_budget_mb),
+            "text_encoder": stage_budget_mb if preload == 0 else min(preload, registry_budget_mb),
             "*": registry_budget_mb,
         })
         if "transformer2" in pipe:
-            source_budgets["transformer2"] = 128 if preload == 0 else min(preload, registry_budget_mb)
+            source_budgets["transformer2"] = stage_budget_mb if preload == 0 else min(preload, registry_budget_mb)
         kwargs["pinnedMemory"] = False
         kwargs["pinnedPEFTLora"] = False
         kwargs["partialPinning"] = False
@@ -4345,7 +4434,15 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             if requested_gpu != primary_multigpu:
                 raise ValueError(f"--gpu ({args.gpu}) must match the first --multigpu device ({primary_multigpu})")
         args.gpu = primary_multigpu
-        attach_multigpu(offloadobj, args.multigpu, fraction=args.multigpu_cache_fraction, verbose=int(verbose_level))
+        profile_cfg = _multigpu_profile_config(profile)
+        requested_fraction = float(getattr(args, "multigpu_cache_fraction", 0.0) or 0.0)
+        multigpu_fraction = requested_fraction if requested_fraction > 0 else float(profile_cfg["cache_fraction"])
+        attach_multigpu(
+            offloadobj,
+            args.multigpu,
+            fraction=multigpu_fraction,
+            verbose=int(verbose_level),
+        )
     offloadobj.tiny_vae = preview_decoder
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
@@ -11585,13 +11682,35 @@ def change_guidance_phases(state, guidance_phases, video_prompt_type):
     return gr.update(visible= guidance_phases >=3 and visible_phases >=3 and multiple_submodels) , gr.update(visible=phase_controls_visible), gr.update(visible=phase_controls_visible and switch_threshold_def.visible, label=switch_threshold_def.label), gr.update(visible= guidance_phases >=3 and visible_phases >=3), gr.update(visible= guidance_phases >=2 and visible_phases >=2), gr.update(visible= guidance_phases >=3 and visible_phases >=3), video_prompt_type
 
 
-memory_profile_choices= [   ("Profile 1, HighRAM_HighVRAM: at least 64 GB of RAM and 24 GB of VRAM, the fastest for short videos with a RTX 3090 / RTX 4090", 1),
-                            ("Profile 2, HighRAM_LowVRAM: at least 64 GB of RAM and 12 GB of VRAM, the most versatile profile with high RAM, better suited for RTX 3070/3080/4070/4080 or for RTX 3090 / RTX 4090 with large pictures batches or long videos", 2),
-                            ("Profile 3, LowRAM_HighVRAM: at least 32 GB of RAM and 24 GB of VRAM, adapted for RTX 3090 / RTX 4090 with limited RAM for good speed short video",3),
-                            ("Profile 3+, GPU-First HighVRAM / MultiGPU default: uses aggregate GPU VRAM and disables reserved/pinned model RAM copies",3.5),
-                            ("Profile 4, LowRAM_LowVRAM (Recommended): at least 32 GB of RAM and 12 GB of VRAM, if you have little VRAM or want to generate longer videos",4),
-                            ("Profile 4+, LowRAM_LowVRAM+: at least 32 GB of RAM and 12 GB of VRAM, variant of Profile 4, slightly slower but needs less VRAM",4.5),
-                            ("Profile 5, VerylowRAM_LowVRAM (Fail safe): at least 24 GB of RAM and 10 GB of VRAM, if you don't have much it won't be fast but maybe it will work",5)]
+standard_memory_profile_choices = [
+    ("Profile 1, HighRAM_HighVRAM: each model loaded whole in VRAM, all models kept in Reserved RAM. The fastest generations and model switches, needs the most RAM and VRAM", 1),
+    ("Profile 2, HighRAM_LowVRAM: all models kept in Reserved RAM, sent to the GPU part by part. Runs models larger than your VRAM, leaves VRAM for long videos or large images and switches models fast, needs a lot of RAM", 2),
+    ("Profile 3, LowRAM_HighVRAM: each model loaded whole in VRAM, only the main models kept in Reserved RAM. Fast generations with less RAM, needs enough VRAM for the whole model", 3),
+    ("Profile 3+, VeryLowRAM_HighVRAM (Recommended for Audio): Profile 3 without any Reserved RAM. Audio models are small enough to fit whole in VRAM, where their language models run much faster; models load more slowly", 3.5),
+    ("Profile 4, LowRAM_LowVRAM (Recommended): only the main models kept in Reserved RAM, sent to the GPU part by part. The most versatile: runs models larger than your VRAM and leaves VRAM for long videos or large images", 4),
+    ("Profile 4+, LowRAM_LowVRAM+: Profile 4 sending one part at a time. Saves up to about 1 GB of VRAM, slightly slower", 4.5),
+    ("Profile 5, VerylowRAM_LowVRAM (Fail safe): almost no Reserved RAM, all models sent to the GPU part by part. For PCs short of RAM and VRAM, slower with short steps such as images", 5),
+]
+
+def _build_multigpu_memory_profile_choices():
+    detected = _multigpu_auto_profile()
+    primary_vram = float(getattr(args, "multigpu_primary_vram_gib", 0.0))
+    choices = []
+    for profile in (8.0, 12.0, 16.0, 24.0):
+        cfg = MULTIGPU_PROFILE_CONFIGS[profile]
+        detected_suffix = (
+            f" (Auto for cuda:0: {primary_vram:.2f} GiB)"
+            if profile == detected else ""
+        )
+        choices.append((
+            f"MultiGPU {cfg['name']}{detected_suffix}: {cfg['description']}; "
+            f"uses all selected GPUs and weights shards by each GPU's actual free VRAM",
+            profile,
+        ))
+    return choices
+
+multigpu_memory_profile_choices = _build_multigpu_memory_profile_choices() if args.multigpu else []
+memory_profile_choices = multigpu_memory_profile_choices if args.multigpu else standard_memory_profile_choices
 
 def check_attn(mode):
     if mode not in attention_modes_installed: return " (NOT INSTALLED)"
@@ -13003,11 +13122,22 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
                     profile_type = get_profile_type_for_model(base_model_type, image_mode_value)
                     profile_type = profile_type[0].upper() + profile_type[1:]
-                    gr.Markdown("<B>You can set a more agressive Memory Profile if you generate only Short Videos or Images<B>")
+                    selected_profile_override = _normalize_profile_override(ui_get("override_profile"))
+                    if args.multigpu:
+                        primary_vram = float(getattr(args, "multigpu_primary_vram_gib", 0.0))
+                        auto_cfg = _multigpu_profile_config(multigpu_auto_profile)
+                        gr.Markdown(
+                            f"<B>MultiGPU profiles are based on the primary GPU (cuda:0: {primary_vram:.2f} GiB). "
+                            "Secondary GPUs may have different VRAM sizes and are weighted by their actual free VRAM.</B>"
+                        )
+                        default_profile_label = f"Default MultiGPU Memory Profile ({auto_cfg['name']})"
+                    else:
+                        gr.Markdown("<B>You can set a more agressive Memory Profile if you generate only Short Videos or Images<B>")
+                        default_profile_label = f"Default {profile_type} Memory Profile"
                     override_profile = gr.Dropdown(
-                        choices=[(f"Default {profile_type} Memory Profile", -1)] + memory_profile_choices,
-                        value=ui_get("override_profile"),
-                        label=f"Override Memory Profile"
+                        choices=[(default_profile_label, -1)] + memory_profile_choices,
+                        value=selected_profile_override,
+                        label="Override Memory Profile"
                     )
 
                     gr.Markdown("<B>You can set a different Attention Mode to improve the quality / compatibility<B>")
