@@ -1601,13 +1601,20 @@ class AccelerateMultiGPU:
 
         moved = 0
         for path, device in device_map.items():
-            if not path or path in module_names or "." not in path:
+            if not path or path in module_names:
                 continue
-            parent_path, tensor_name = path.rsplit(".", 1)
-            try:
-                parent = model.get_submodule(parent_path)
-            except Exception:
-                continue
+
+            if "." in path:
+                parent_path, tensor_name = path.rsplit(".", 1)
+                try:
+                    parent = model.get_submodule(parent_path)
+                except Exception:
+                    continue
+            else:
+                # Root-level direct parameters (for example LTX-Video's
+                # scale_shift_table) are valid device-map coverage keys too.
+                parent = model
+                tensor_name = path
 
             is_parameter = tensor_name in getattr(parent, "_parameters", {})
             is_buffer = tensor_name in getattr(parent, "_buffers", {})
