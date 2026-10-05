@@ -38,6 +38,43 @@ class AccelerateMultiGPU:
             print(f"[MultiGPU] {message}", flush=True)
 
     @staticmethod
+    def _iter_modules_unique(root):
+        """Iterate an nn.Module graph once per object, even if cyclic."""
+        stack = [root]
+        seen = set()
+        while stack:
+            module = stack.pop()
+            if not isinstance(module, torch.nn.Module):
+                continue
+            ident = id(module)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            yield module
+            children = getattr(module, "_modules", None)
+            if isinstance(children, dict):
+                stack.extend(child for child in children.values() if child is not None)
+
+    def _detach_registered_lora_owner_cycles(self, model_id, model):
+        """Keep MMGP _lora_owner references without registering them as children."""
+        fixed = 0
+        for module in list(self._iter_modules_unique(model)):
+            modules = getattr(module, "_modules", None)
+            if not isinstance(modules, dict):
+                continue
+            owner = modules.get("_lora_owner")
+            if owner is None:
+                continue
+            try:
+                del modules["_lora_owner"]
+                object.__setattr__(module, "_lora_owner", owner)
+                fixed += 1
+            except Exception:
+                pass
+        if fixed:
+            self._log(f"{model_id}: converted {fixed} registered _lora_owner link(s) to non-module references")
+
+    @staticmethod
     def _mmgp_wrapper_target(forward, module):
         """Return the callable wrapped by one MMGP forward hook, if any.
 
@@ -77,7 +114,7 @@ class AccelerateMultiGPU:
 
         saved = []
         removed = 0
-        for module in model.modules():
+        for module in self._iter_modules_unique(model):
             current = getattr(module, "forward", None)
             if not callable(current):
                 continue
@@ -116,7 +153,7 @@ class AccelerateMultiGPU:
     def _sanitize_accelerate_old_forwards(self, model_id, model):
         """Ensure Accelerate never calls back into an MMGP wrapper."""
         fixed = 0
-        for module in model.modules():
+        for module in self._iter_modules_unique(model):
             old_forward = getattr(module, "_old_forward", None)
             if not callable(old_forward):
                 continue
@@ -291,11 +328,38 @@ class AccelerateMultiGPU:
                 self._log(f"Host working set trimmed{suffix}")
 
     def _remove_accelerate_hooks(self, model):
+        """Remove Accelerate hooks without recursive child traversal."""
         try:
-            from accelerate.hooks import remove_hook_from_submodules
-            remove_hook_from_submodules(model)
+            from accelerate.hooks import remove_hook_from_module
         except ImportError:
-            pass
+            return
+
+        removed = 0
+        for module in self._iter_modules_unique(model):
+            if not hasattr(module, "_hf_hook") and not hasattr(module, "_old_forward"):
+                continue
+            try:
+                remove_hook_from_module(module, recurse=False)
+                removed += 1
+            except Exception:
+                old_forward = getattr(module, "_old_forward", None)
+                if callable(old_forward):
+                    try:
+                        module.forward = old_forward
+                    except Exception:
+                        pass
+                    try:
+                        delattr(module, "_old_forward")
+                    except Exception:
+                        pass
+                if hasattr(module, "_hf_hook"):
+                    try:
+                        delattr(module, "_hf_hook")
+                    except Exception:
+                        pass
+
+        if removed and self.verbose >= 2:
+            self._log(f"removed Accelerate/fake HF hooks from {removed} module(s)")
 
     def _suspend_mmgp_blocks(self, model_id):
         if model_id in self._suspended_mmgp_blocks:
@@ -335,7 +399,7 @@ class AccelerateMultiGPU:
                 except Exception:
                     pass
 
-        for module in model.modules():
+        for module in self._iter_modules_unique(model):
             # Do not call Accelerate's normal detach path here: for Quanto it
             # may materialize a meta tensor on CPU and transiently duplicate a
             # large weight. Restore the original forward callable directly.
@@ -416,7 +480,7 @@ class AccelerateMultiGPU:
             "WanTransformerBlock",
             "Wan2TransformerBlock",
         }
-        known = {module.__class__.__name__ for module in model.modules()}
+        known = {module.__class__.__name__ for module in self._iter_modules_unique(model)}
         for name in common:
             if name in known and name not in classes:
                 classes.append(name)
@@ -605,6 +669,7 @@ class AccelerateMultiGPU:
         if model_id in self.dispatched:
             return self.dispatched[model_id]
 
+        self._detach_registered_lora_owner_cycles(model_id, model)
         self._remove_accelerate_hooks(model)
         self._suspend_mmgp_forwards(model_id, model)
 
