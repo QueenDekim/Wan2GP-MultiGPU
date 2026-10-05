@@ -7359,7 +7359,11 @@ def generate_media(
         errors = check_loras_exist(model_type, loras_selected, True, send_cmd, gen=gen)
         if len(errors) > 0 : raise gr.Error(errors)
         loras_selected = [ get_lora_local_path(lora_dir, lora) for lora in loras_selected]
-        pinnedLora = not is_mps and loaded_profile !=5  # and transformer_loras_filenames == None False # # #
+        # In GPU-first MultiGPU mode never duplicate LoRA tensors into
+        # Windows pinned/reserved RAM. MMGP's LoRA pinning path is separate
+        # from profile perc_reserved_mem_max and can otherwise reserve several
+        # GiB even when model pinning is disabled.
+        pinnedLora = (not args.multigpu) and (not is_mps) and loaded_profile != 5
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
         offload.load_loras_into_model(
