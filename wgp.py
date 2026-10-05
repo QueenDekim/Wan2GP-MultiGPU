@@ -3569,7 +3569,27 @@ def _normalize_profile_override(profile, *, multigpu=None):
     allowed = MULTIGPU_PROFILE_CONFIGS if enabled else STANDARD_WAN2GP_PROFILE_VALUES
     return value if value in allowed else -1.0
 
+# Keep MultiGPU defaults separate from Wan2GP's standard profile settings.
+# -1 means "Auto from cuda:0 VRAM class".
+for _key in (
+    "multigpu_video_profile",
+    "multigpu_image_profile",
+    "multigpu_audio_profile",
+):
+    server_config.setdefault(_key, -1.0)
+    server_config[_key] = _normalize_profile_override(
+        server_config.get(_key, -1.0),
+        multigpu=True,
+    )
+
 multigpu_auto_profile = _multigpu_auto_profile()
+
+def _configured_multigpu_profile(kind):
+    saved = _normalize_profile_override(
+        server_config.get(f"multigpu_{kind}_profile", -1.0),
+        multigpu=True,
+    )
+    return multigpu_auto_profile if saved < 0 else saved
 
 if args.multigpu and force_profile_no >= 0:
     normalized_force_profile = _normalize_profile_override(force_profile_no, multigpu=True)
@@ -3583,9 +3603,14 @@ if args.multigpu and force_profile_no >= 0:
     else:
         force_profile_no = normalized_force_profile
 
-default_profile_video = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["video_profile"])
-default_profile_image = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["image_profile"])
-default_profile_audio = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["audio_profile"])
+if args.multigpu:
+    default_profile_video = force_profile_no if force_profile_no >= 0 else _configured_multigpu_profile("video")
+    default_profile_image = force_profile_no if force_profile_no >= 0 else _configured_multigpu_profile("image")
+    default_profile_audio = force_profile_no if force_profile_no >= 0 else _configured_multigpu_profile("audio")
+else:
+    default_profile_video = force_profile_no if force_profile_no >= 0 else server_config["video_profile"]
+    default_profile_image = force_profile_no if force_profile_no >= 0 else server_config["image_profile"]
+    default_profile_audio = force_profile_no if force_profile_no >= 0 else server_config["audio_profile"]
 default_profile = default_profile_video
 if multigpu_auto_profile is not None:
     primary_vram = float(getattr(args, "multigpu_primary_vram_gib", 0.0))
