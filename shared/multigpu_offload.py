@@ -74,6 +74,60 @@ class AccelerateMultiGPU:
         if fixed:
             self._log(f"{model_id}: converted {fixed} registered _lora_owner link(s) to non-module references")
 
+    def _detach_registered_module_cycles(self, model_id, model):
+        """De-register only back-edges that make the nn.Module graph cyclic.
+
+        Accelerate calls named_parameters(remove_duplicate=False), whose
+        named_modules traversal has no cycle protection. Shared modules in a
+        normal DAG are preserved; only edges to an ancestor currently being
+        visited are converted to plain Python references.
+        """
+        state = {id(model): 1}  # 1=visiting, 2=finished
+        stack = [(model, iter(list(getattr(model, "_modules", {}).items())))]
+        fixed = []
+
+        while stack:
+            parent, children = stack[-1]
+            try:
+                name, child = next(children)
+            except StopIteration:
+                state[id(parent)] = 2
+                stack.pop()
+                continue
+
+            if not isinstance(child, torch.nn.Module):
+                continue
+
+            child_state = state.get(id(child), 0)
+            if child_state == 1:
+                modules = getattr(parent, "_modules", None)
+                if isinstance(modules, dict) and modules.get(name) is child:
+                    try:
+                        del modules[name]
+                        object.__setattr__(parent, name, child)
+                        fixed.append(name)
+                    except Exception:
+                        pass
+                continue
+
+            if child_state == 2:
+                # Legitimate shared module / DAG edge.
+                continue
+
+            state[id(child)] = 1
+            stack.append((
+                child,
+                iter(list(getattr(child, "_modules", {}).items())),
+            ))
+
+        if fixed:
+            preview = ", ".join(fixed[:6])
+            if len(fixed) > 6:
+                preview += ", ..."
+            self._log(
+                f"{model_id}: de-registered {len(fixed)} cyclic module edge(s): {preview}"
+            )
+
     @staticmethod
     def _mmgp_wrapper_target(forward, module):
         """Return the callable wrapped by one MMGP forward hook, if any.
@@ -670,6 +724,7 @@ class AccelerateMultiGPU:
             return self.dispatched[model_id]
 
         self._detach_registered_lora_owner_cycles(model_id, model)
+        self._detach_registered_module_cycles(model_id, model)
         self._remove_accelerate_hooks(model)
         self._suspend_mmgp_forwards(model_id, model)
 
