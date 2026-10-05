@@ -27,6 +27,7 @@ class AccelerateMultiGPU:
         # be empty so MMGP cannot silently pull a 1-2 GiB block back to GPU0.
         self._suspended_mmgp_blocks: dict[str, object] = {}
         self._suspended_mmgp_forwards: dict[str, list[tuple[torch.nn.Module, object]]] = {}
+        self._original_tensor_backing: dict[str, list[tuple[torch.nn.Module, str, object, bool]]] = {}
         self.installed = False
 
     @property
@@ -381,6 +382,70 @@ class AccelerateMultiGPU:
             else:
                 self._log(f"Host working set trimmed{suffix}")
 
+    def _ensure_state_dict_compat(self, model_id, model):
+        """Repair MMGP Quanto state_dict monkey-patch for standard PyTorch calls."""
+        real_state_dict = getattr(model, "_real_state_dict", None)
+        if not callable(real_state_dict) or getattr(model, "_wgp_state_dict_compat", False):
+            return
+
+        import traceback
+        from collections import OrderedDict
+
+        def state_dict_compat(*args, **kwargs):
+            real_sd = real_state_dict(*args, **kwargs)
+            # destination/prefix/keep_vars means this is a standard PyTorch
+            # recursive state_dict call (Accelerate relies on this contract).
+            if args or kwargs:
+                return real_sd
+            fakeit = any("_lora_" in frame.name for frame in traceback.extract_stack(limit=6))
+            if not fakeit:
+                return real_sd
+            sd = OrderedDict()
+            for key, value in real_sd.items():
+                if key.endswith("._data"):
+                    key = key[:-6]
+                sd[key] = value
+            return sd
+
+        model.state_dict = state_dict_compat
+        model._wgp_state_dict_compat = True
+        if self.verbose >= 2:
+            self._log(f"{model_id}: repaired MMGP state_dict signature for Accelerate")
+
+    def _capture_original_tensor_backing(self, model_id, model):
+        """Keep references to existing CPU/MMAP tensors before CUDA dispatch."""
+        if model_id in self._original_tensor_backing:
+            return
+        entries = []
+        for module in self._iter_modules_unique(model):
+            for name, value in getattr(module, "_parameters", {}).items():
+                if value is not None:
+                    entries.append((module, name, value, False))
+            for name, value in getattr(module, "_buffers", {}).items():
+                if value is not None:
+                    entries.append((module, name, value, True))
+        self._original_tensor_backing[model_id] = entries
+        if self.verbose >= 2:
+            self._log(f"{model_id}: captured {len(entries)} original CPU/MMAP tensor reference(s)")
+
+    def _restore_original_tensor_backing(self, model_id):
+        entries = self._original_tensor_backing.pop(model_id, None)
+        if not entries:
+            return 0
+        restored = 0
+        for module, name, value, is_buffer in entries:
+            try:
+                registry = module._buffers if is_buffer else module._parameters
+                registry[name] = value
+                restored += 1
+            except Exception:
+                try:
+                    setattr(module, name, value)
+                    restored += 1
+                except Exception:
+                    pass
+        return restored
+
     def _remove_accelerate_hooks(self, model):
         """Remove Accelerate hooks without recursive child traversal."""
         try:
@@ -441,6 +506,11 @@ class AccelerateMultiGPU:
                 break
 
         self._unload_dispatched_loras(model)
+
+        if model_id is not None:
+            restored_backing = self._restore_original_tensor_backing(model_id)
+            if restored_backing and self.verbose >= 2:
+                self._log(f"{model_id}: restored {restored_backing} original CPU/MMAP tensor reference(s)")
 
         original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
         if model_id is not None:
@@ -721,14 +791,17 @@ class AccelerateMultiGPU:
     def _tensor_nbytes(tensor):
         if tensor is None:
             return 0
+        data = getattr(tensor, "_data", None)
+        if torch.is_tensor(data):
+            total = int(data.numel()) * int(data.element_size())
+            scale = getattr(tensor, "_scale", None)
+            if torch.is_tensor(scale):
+                total += int(scale.numel()) * int(scale.element_size())
+            return total
         try:
             return int(tensor.numel()) * int(tensor.element_size())
         except Exception:
-            data = getattr(tensor, "_data", None)
-            try:
-                return int(data.numel()) * int(data.element_size())
-            except Exception:
-                return 0
+            return 0
 
     def _module_nbytes(self, module):
         """Approximate resident bytes without following external backrefs."""
@@ -866,25 +939,16 @@ class AccelerateMultiGPU:
             ranges.append((start, end))
             start = end
 
-        device_map = {}
+        # Parent mapping covers direct parameters such as scale_shift_table;
+        # more-specific child entries override it where required.
+        device_map = {"velocity_model": self.devices[0]}
         last_device = self.devices[-1]
-        for name, parameter in getattr(velocity_model, "_parameters", {}).items():
-            if parameter is not None:
-                device_map[f"velocity_model.{name}"] = (
-                    last_device if name in output_param_names else self.devices[0]
-                )
-        for name, buffer in getattr(velocity_model, "_buffers", {}).items():
-            if buffer is not None:
-                device_map[f"velocity_model.{name}"] = (
-                    last_device if name in output_param_names else self.devices[0]
-                )
 
         for child_name, child in getattr(velocity_model, "_modules", {}).items():
             if child is None or child_name == "transformer_blocks":
                 continue
-            device_map[f"velocity_model.{child_name}"] = (
-                last_device if child_name in output_child_names else self.devices[0]
-            )
+            if child_name in output_child_names:
+                device_map[f"velocity_model.{child_name}"] = last_device
 
         range_logs = []
         for device, (start, end) in zip(self.devices, ranges):
@@ -920,6 +984,8 @@ class AccelerateMultiGPU:
 
         self._detach_registered_lora_owner_cycles(model_id, model)
         self._detach_registered_module_cycles(model_id, model)
+        self._ensure_state_dict_compat(model_id, model)
+        self._capture_original_tensor_backing(model_id, model)
         self._remove_accelerate_hooks(model)
         self._suspend_mmgp_forwards(model_id, model)
 
@@ -1098,6 +1164,16 @@ class AccelerateMultiGPU:
                         torch.cuda.ipc_collect()
             except Exception:
                 pass
+        if self.verbose >= 2:
+            parts = []
+            for device in self.devices:
+                try:
+                    free, total = torch.cuda.mem_get_info(device.index)
+                    parts.append(f"{device}={free / 1024**3:.2f}/{total / 1024**3:.2f} GiB free")
+                except Exception:
+                    pass
+            if parts:
+                self._log(f"{model_id}: post-unload VRAM: " + ", ".join(parts))
 
     def unload_all(self, keep=None, *args, **kwargs):
         # MMGP 3.8.2 may call unload_all(keep=[...]) to preserve cotenants.
