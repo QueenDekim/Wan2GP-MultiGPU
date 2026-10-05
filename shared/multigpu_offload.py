@@ -26,6 +26,7 @@ class AccelerateMultiGPU:
         # active model is dispatched by Accelerate, its block registry must
         # be empty so MMGP cannot silently pull a 1-2 GiB block back to GPU0.
         self._suspended_mmgp_blocks: dict[str, object] = {}
+        self._suspended_mmgp_forwards: dict[str, list[tuple[torch.nn.Module, object]]] = {}
         self.installed = False
 
     @property
@@ -36,56 +37,80 @@ class AccelerateMultiGPU:
         if self.verbose >= 1:
             print(f"[MultiGPU] {message}", flush=True)
 
-    def _restore_mmgp_forwards(self, model):
-        """Remove MMGP forward wrappers before Accelerate takes ownership.
+    @staticmethod
+    def _mmgp_wrapper_target(forward, module):
+        """Return the callable wrapped by one MMGP forward hook, if any.
 
-        MMGP wraps module.forward with functions such as check_change_module.
-        Clearing blocks_of_modules is not sufficient: the wrapper itself can
-        still request a model block on every forward. Recover the previous
-        callable from the wrapper closure instead of relying on private
-        attribute names that changed between MMGP releases.
+        MMGP builds hooks with functools.partial + update_wrapper. update_wrapper
+        intentionally copies the wrapped callable's __module__/__name__, so
+        looking at forward.__module__ is unreliable. The actual MMGP wrapper is
+        forward.func, while __wrapped__ (or module._mm_forward) points at the
+        previous callable.
         """
-        restored = 0
+        wrapper = getattr(forward, "func", forward)
+        wrapper_module = getattr(wrapper, "__module__", "") or ""
+        wrapper_name = getattr(wrapper, "__name__", "") or ""
+        is_mmgp = (
+            wrapper_module == "mmgp.offload"
+            or wrapper_name.startswith("check_load_into_GPU_needed")
+            or wrapper_name.startswith("check_change_module")
+            or wrapper_name.startswith("_mm_wrap_")
+        )
+        if not is_mmgp:
+            return None
+        previous = getattr(forward, "__wrapped__", None)
+        if previous is None:
+            previous = getattr(module, "_mm_forward", None)
+        return previous if callable(previous) and previous is not forward else None
+
+    def _suspend_mmgp_forwards(self, model_id, model):
+        """Temporarily remove *all* MMGP forward wrappers for Accelerate.
+
+        The wrappers are saved verbatim and restored when the stage unloads.
+        This prevents MMGP from performing an independent RAM->GPU block load
+        from inside Accelerate's _old_forward.
+        """
+        if model_id in self._suspended_mmgp_forwards:
+            return
+
+        saved = []
+        removed = 0
         for module in model.modules():
-            forward = getattr(module, "forward", None)
+            current = getattr(module, "forward", None)
+            if not callable(current):
+                continue
+
+            original_wrapper = current
+            changed = False
             seen = set()
-            while callable(forward) and id(forward) not in seen:
-                seen.add(id(forward))
-                fn_module = getattr(forward, "__module__", "")
-                fn_name = getattr(forward, "__name__", "")
-                if fn_module != "mmgp.offload" or not fn_name.startswith("check_"):
-                    break
-
-                previous = None
-                closure = getattr(forward, "__closure__", None) or ()
-                for cell in closure:
-                    try:
-                        candidate = cell.cell_contents
-                    except ValueError:
-                        continue
-                    if not callable(candidate) or candidate is forward:
-                        continue
-                    candidate_module = getattr(candidate, "__module__", "")
-                    candidate_name = getattr(candidate, "__name__", "")
-                    if candidate_module != "mmgp.offload" or not candidate_name.startswith("check_"):
-                        previous = candidate
-                        break
-
+            while callable(current) and id(current) not in seen:
+                seen.add(id(current))
+                previous = self._mmgp_wrapper_target(current, module)
                 if previous is None:
                     break
+                current = previous
+                changed = True
+                removed += 1
 
-                module.forward = previous
-                forward = previous
-                restored += 1
+            if changed:
+                saved.append((module, original_wrapper))
+                module.forward = current
 
-            if hasattr(module, "_hf_hook"):
-                try:
-                    delattr(module, "_hf_hook")
-                except AttributeError:
-                    pass
+        self._suspended_mmgp_forwards[model_id] = saved
+        if removed:
+            self._log(f"{model_id}: suspended {removed} MMGP forward hook(s)")
 
-        if restored:
-            self._log(f"Removed {restored} MMGP forward wrappers from active model")
+    def _restore_mmgp_forwards(self, model_id):
+        saved = self._suspended_mmgp_forwards.pop(model_id, None)
+        if not saved:
+            return
+        for module, wrapper in saved:
+            try:
+                module.forward = wrapper
+            except Exception:
+                pass
+        self._log(f"{model_id}: restored {len(saved)} MMGP forward hook(s)")
+
     def _remove_accelerate_hooks(self, model):
         try:
             from accelerate.hooks import remove_hook_from_submodules
@@ -117,8 +142,6 @@ class AccelerateMultiGPU:
             if candidate is model:
                 model_id = candidate_id
                 break
-
-        self._restore_mmgp_forwards(model)
 
         original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
         if model_id is not None:
@@ -156,6 +179,7 @@ class AccelerateMultiGPU:
 
         if model_id is not None:
             self._restore_mmgp_blocks(model_id)
+            self._restore_mmgp_forwards(model_id)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -363,8 +387,8 @@ class AccelerateMultiGPU:
         if model_id in self.dispatched:
             return self.dispatched[model_id]
 
-        self._restore_mmgp_forwards(model)
         self._remove_accelerate_hooks(model)
+        self._suspend_mmgp_forwards(model_id, model)
 
         # Gemma uses tied input/output embeddings. Accelerate warns about this
         # when inferring a device map and may otherwise put lm_head on disk.
@@ -441,10 +465,8 @@ class AccelerateMultiGPU:
         # Accelerate and its parameters are placed by the device map.
         self._suspend_mmgp_blocks(model_id)
 
-        # MMGP's own forward hooks must be gone. Otherwise its 100 MB budget
-        # can still trigger RAM -> GPU transfers even though Accelerate owns
-        # the model map.
-        self._restore_mmgp_forwards(model)
+        # MMGP forward hooks are suspended above. Accelerate must see the
+        # original module forwards, never MMGP's RAM->GPU wrappers.
 
         # Keep Accelerate's standard dispatch path. It handles cross-device
         # activation transfers and tied-parameter bookkeeping.
@@ -462,6 +484,7 @@ class AccelerateMultiGPU:
             # Never leave MMGP with a disabled block registry if Accelerate
             # fails during dispatch.
             self._restore_mmgp_blocks(model_id)
+            self._restore_mmgp_forwards(model_id)
             raise
 
         self.dispatched[model_id] = dispatched
@@ -507,6 +530,8 @@ class AccelerateMultiGPU:
     def _release_mmgp(self):
         for model_id in list(self._suspended_mmgp_blocks):
             self._restore_mmgp_blocks(model_id)
+        for model_id in list(self._suspended_mmgp_forwards):
+            self._restore_mmgp_forwards(model_id)
 
     def release(self):
         if not self.installed:
