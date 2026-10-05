@@ -50,6 +50,13 @@ def to_denoised(
     Returns:
         Denoised sample
     """
+    # MultiGPU transformer sharding may produce velocity on the final shard
+    # while the latent/sample remains on the pipeline primary device. Return
+    # denoised data on the sample device so the rest of the pipeline keeps a
+    # stable owner and only one cross-GPU copy is needed after the last block.
+    target_device = sample.device
     if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype)
-    return (sample.to(calc_dtype) - velocity.to(calc_dtype) * sigma).to(sample.dtype)
+        sigma = sigma.to(device=target_device, dtype=calc_dtype, non_blocking=True)
+    sample_calc = sample.to(dtype=calc_dtype)
+    velocity_calc = velocity.to(device=target_device, dtype=calc_dtype, non_blocking=True)
+    return (sample_calc - velocity_calc * sigma).to(sample.dtype)
