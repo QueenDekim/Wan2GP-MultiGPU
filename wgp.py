@@ -2576,6 +2576,84 @@ attention_modes_supported = get_supported_attention_modes()
 override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
+
+def _resolve_multigpu_runtime(args):
+    """Normalize MultiGPU CLI state and auto-select every visible CUDA GPU."""
+    requested = str(getattr(args, "multigpu", "") or "").strip()
+    lowered = requested.lower()
+    if is_mps or not torch.cuda.is_available():
+        args.multigpu = ""
+        args.multigpu_total_vram_gib = 0.0
+        return []
+
+    count = torch.cuda.device_count()
+    if lowered in ("off", "none", "false", "0", "single", "disabled"):
+        args.multigpu = ""
+        args.multigpu_total_vram_gib = 0.0
+        return []
+
+    def normalize_one(value):
+        value = str(value).strip()
+        return value if value.startswith("cuda:") else f"cuda:{value}"
+
+    if lowered in ("", "auto", "all"):
+        if count < 2:
+            args.multigpu = ""
+            args.multigpu_total_vram_gib = (
+                torch.cuda.get_device_properties(0).total_memory / 1024**3 if count else 0.0
+            )
+            return ["cuda:0"] if count else []
+
+        primary = normalize_one(args.gpu) if str(args.gpu or "").strip() else "cuda:0"
+        primary_index = torch.device(primary).index
+        if primary_index is None or primary_index < 0 or primary_index >= count:
+            raise ValueError(f"Invalid primary CUDA device: {primary}")
+        indices = [primary_index] + [i for i in range(count) if i != primary_index]
+        devices = [f"cuda:{i}" for i in indices]
+    else:
+        devices = []
+        seen = set()
+        for value in requested.split(","):
+            if not value.strip():
+                continue
+            device = normalize_one(value)
+            index = torch.device(device).index
+            if index is None or index < 0 or index >= count:
+                raise ValueError(f"Invalid MultiGPU CUDA device: {device}")
+            if index not in seen:
+                devices.append(f"cuda:{index}")
+                seen.add(index)
+        if len(devices) < 2:
+            args.multigpu = ""
+            args.multigpu_total_vram_gib = (
+                torch.cuda.get_device_properties(devices[0]).total_memory / 1024**3
+                if devices else 0.0
+            )
+            if devices and not str(args.gpu or "").strip():
+                args.gpu = devices[0]
+            return devices
+
+    args.multigpu = ",".join(devices)
+    if not str(args.gpu or "").strip():
+        args.gpu = devices[0]
+    total_vram = sum(torch.cuda.get_device_properties(d).total_memory for d in devices)
+    args.multigpu_total_vram_gib = total_vram / 1024**3
+
+    print(
+        f"[MultiGPU] Auto GPU set: {args.multigpu} "
+        f"({args.multigpu_total_vram_gib:.2f} GiB aggregate VRAM)",
+        flush=True,
+    )
+    for no, device in enumerate(devices):
+        props = torch.cuda.get_device_properties(device)
+        print(
+            f"[MultiGPU] GPU#{no} {device}: {props.name}, "
+            f"{props.total_memory / 1024**3:.2f} GiB",
+            flush=True,
+        )
+    return devices
+
+multigpu_devices_runtime = _resolve_multigpu_runtime(args)
 migrate_loras_layout()
 
 gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
@@ -3412,10 +3490,25 @@ if len(args.attention)> 0:
     else:
         raise Exception(f"Unknown attention mode '{args.attention}'")
 
-default_profile_video = force_profile_no if force_profile_no >= 0 else server_config["video_profile"]
-default_profile_image = force_profile_no if force_profile_no >= 0 else server_config["image_profile"]
-default_profile_audio = force_profile_no if force_profile_no >= 0 else server_config["audio_profile"]
+def _multigpu_auto_profile():
+    if not args.multigpu:
+        return None
+    total_vram = float(getattr(args, "multigpu_total_vram_gib", 0.0))
+    # 3.5 = high-VRAM behavior without reserved/pinned host-memory copies.
+    # Below ~24 GiB aggregate VRAM keep the low-VRAM scheduling fallback.
+    return 3.5 if total_vram >= 24.0 else 4.5
+
+multigpu_auto_profile = _multigpu_auto_profile()
+default_profile_video = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["video_profile"])
+default_profile_image = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["image_profile"])
+default_profile_audio = force_profile_no if force_profile_no >= 0 else (multigpu_auto_profile if multigpu_auto_profile is not None else server_config["audio_profile"])
 default_profile = default_profile_video
+if multigpu_auto_profile is not None:
+    print(
+        f"[MultiGPU] Automatic WGP memory profile: {multigpu_auto_profile} "
+        f"for {getattr(args, 'multigpu_total_vram_gib', 0.0):.2f} GiB aggregate VRAM",
+        flush=True,
+    )
 loaded_profile = force_profile_no = -1
 compile = server_config.get("compile", "")
 if args.compile:
@@ -3918,31 +4011,57 @@ def get_profile_type_for_model(model_type, image_mode=0):
     return "video"
 
 def init_pipe(pipe, kwargs, profile):
-    preload =int(args.preload)
+    preload = int(args.preload)
     if preload == 0:
         preload = server_config.get("preload_in_VRAM", 0)
 
-    kwargs["extraModelsToQuantize"]=  None
+    kwargs["extraModelsToQuantize"] = None
     source_budgets = kwargs.get("budgets", None)
-    if source_budgets is None:  kwargs["budgets"] = source_budgets = {}
+    if source_budgets is None:
+        kwargs["budgets"] = source_budgets = {}
+
+    if args.multigpu:
+        # MultiGPU profile: Accelerate owns active-model CUDA residency across
+        # all cards. MMGP must not pre-stage/pin large copies in system RAM or
+        # consume a large hidden budget on GPU#0 before Accelerate dispatch.
+        mmgp_profile = 3
+        primary = torch.device(args.multigpu.split(",")[0])
+        primary_total_mb = torch.cuda.get_device_properties(primary).total_memory // (1024**2)
+        registry_budget_mb = max(768, min(2048, int(primary_total_mb * 0.10)))
+        source_budgets.update({
+            "transformer": 128 if preload == 0 else min(preload, registry_budget_mb),
+            "text_encoder": 128 if preload == 0 else min(preload, registry_budget_mb),
+            "*": registry_budget_mb,
+        })
+        if "transformer2" in pipe:
+            source_budgets["transformer2"] = 128 if preload == 0 else min(preload, registry_budget_mb)
+        kwargs["pinnedMemory"] = False
+        kwargs["pinnedPEFTLora"] = False
+        kwargs["partialPinning"] = False
+        kwargs["asyncTransfers"] = False
+        return mmgp_profile
+
     mmgp_profile = int(profile)
     if mmgp_profile in (2, 4, 5):
-        default_transformer_budget = default_transformer2_budget= kwargs.get("budgets", 100) 
+        default_transformer_budget = default_transformer2_budget = kwargs.get("budgets", 100)
         if isinstance(default_transformer_budget, dict):
-            default_transformer_budget = default_transformer_budget.get("transformer", 100) 
-            default_transformer2_budget = default_transformer2_budget.get("transformer2", 100) 
+            default_transformer_budget = default_transformer_budget.get("transformer", 100)
+            default_transformer2_budget = default_transformer2_budget.get("transformer2", 100)
 
-        budgets = { "transformer" : default_transformer_budget if preload  == 0 else preload, "text_encoder" : 100 if preload  == 0 else preload, "*" : max(1000 if profile==5 else 3000 , preload) }
+        budgets = {
+            "transformer": default_transformer_budget if preload == 0 else preload,
+            "text_encoder": 100 if preload == 0 else preload,
+            "*": max(1000 if profile == 5 else 3000, preload),
+        }
         if "transformer2" in pipe:
-            budgets["transformer2"] = default_transformer2_budget if preload  == 0 else preload
+            budgets["transformer2"] = default_transformer2_budget if preload == 0 else preload
         source_budgets.update(budgets)
     elif mmgp_profile == 3:
-        source_budgets.update({ "*" : "70%" })
+        source_budgets.update({"*": "70%"})
 
-    if "transformer2" in pipe:
-        if profile in [3,4]:
-            kwargs["pinnedMemory"] = ["transformer", "transformer2"]
-    
+    if "transformer2" in pipe and profile in [3, 4]:
+        kwargs["pinnedMemory"] = ["transformer", "transformer2"]
+
     if profile == 4.5:
         kwargs["asyncTransfers"] = False
     elif profile == 3.5:
@@ -4217,7 +4336,7 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             )
         offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
     if args.multigpu:
-        multigpu_devices = [x.strip() for x in args.multigpu.split(",") if x.strip()]
+        multigpu_devices = list(multigpu_devices_runtime) or [x.strip() for x in args.multigpu.split(",") if x.strip()]
         primary_multigpu = multigpu_devices[0]
         if not primary_multigpu.startswith("cuda:"):
             primary_multigpu = f"cuda:{primary_multigpu}"
@@ -11465,7 +11584,7 @@ def change_guidance_phases(state, guidance_phases, video_prompt_type):
 memory_profile_choices= [   ("Profile 1, HighRAM_HighVRAM: at least 64 GB of RAM and 24 GB of VRAM, the fastest for short videos with a RTX 3090 / RTX 4090", 1),
                             ("Profile 2, HighRAM_LowVRAM: at least 64 GB of RAM and 12 GB of VRAM, the most versatile profile with high RAM, better suited for RTX 3070/3080/4070/4080 or for RTX 3090 / RTX 4090 with large pictures batches or long videos", 2),
                             ("Profile 3, LowRAM_HighVRAM: at least 32 GB of RAM and 24 GB of VRAM, adapted for RTX 3090 / RTX 4090 with limited RAM for good speed short video",3),
-                            ("Profile 3+, VeryLowRAM_HighVRAM: at least 32 GB of RAM and 24 GB of VRAM, variant of Profile 3 that won't used Reserved Memory to reduce RAM usage",3.5),
+                            ("Profile 3+, GPU-First HighVRAM / MultiGPU default: uses aggregate GPU VRAM and disables reserved/pinned model RAM copies",3.5),
                             ("Profile 4, LowRAM_LowVRAM (Recommended): at least 32 GB of RAM and 12 GB of VRAM, if you have little VRAM or want to generate longer videos",4),
                             ("Profile 4+, LowRAM_LowVRAM+: at least 32 GB of RAM and 12 GB of VRAM, variant of Profile 4, slightly slower but needs less VRAM",4.5),
                             ("Profile 5, VerylowRAM_LowVRAM (Fail safe): at least 24 GB of RAM and 10 GB of VRAM, if you don't have much it won't be fast but maybe it will work",5)]
