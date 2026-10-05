@@ -53,8 +53,8 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--perc-reserved-mem-max", type=float, default=0, help="percent of RAM allocated to Reserved RAM")
     add("--server-name", type=str, default="", help="Server name")
     add("--gpu", type=str, default="", help="Default GPU Device")
-    add("--multigpu", type=str, default="", help="Tiered MultiGPU devices, e.g. cuda:0,cuda:1,cuda:2")
-    add("--multigpu-cache-fraction", type=float, default=0.82, help="Maximum fraction of each secondary GPU used by the MultiGPU cache")
+    add("--multigpu", type=str, default="auto", help="MultiGPU devices. Default 'auto' uses every visible CUDA PCIe GPU; use 'off' to force single-GPU mode or pass cuda:0,cuda:1,... explicitly")
+    add("--multigpu-cache-fraction", type=float, default=0.92, help="Maximum fraction of free VRAM available to MultiGPU model sharding (default: 0.92)")
     add("--open-browser", action="store_true", help="open browser")
     # Deprecated model-selection shortcuts: keep accepting existing launch scripts.
     add("--t2v", action="store_true", help=argparse.SUPPRESS)
