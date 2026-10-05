@@ -722,18 +722,44 @@ class AccelerateMultiGPU:
         model = self._dispatch(model_id)
         self.offload.loaded_blocks[model_id] = None
 
-        devices_used = set()
-        for module in model.modules():
-            param = next(module.parameters(recurse=False), None)
+        # Keep MMGP's own residency bookkeeping coherent. ensure_model_loaded()
+        # uses active_models_ids to decide whether a model switch is required;
+        # if we dispatch through Accelerate without updating these lists MMGP
+        # will immediately try to unload/reload an already-active model.
+        active_ids = getattr(self.offload, "active_models_ids", None)
+        active_models = getattr(self.offload, "active_models", None)
+        if isinstance(active_ids, list) and model_id not in active_ids:
+            active_ids.append(model_id)
+        if isinstance(active_models, list) and model not in active_models:
+            active_models.append(model)
+
+        return model
+
+    def _mark_inactive(self, model_id, model=None):
+        active_ids = getattr(self.offload, "active_models_ids", None)
+        active_models = getattr(self.offload, "active_models", None)
+
+        if isinstance(active_ids, list):
+            while model_id in active_ids:
+                active_ids.remove(model_id)
+
+        if isinstance(active_models, list):
+            if model is None:
+                model = getattr(self.offload, "models", {}).get(model_id)
+            if model is not None:
+                while model in active_models:
+                    active_models.remove(model)
 
     def unload(self, model_id, blocks_name=None, cache=True):
         if blocks_name is not None:
             return
         model = self.dispatched.pop(model_id, None)
         if model is None:
+            self._mark_inactive(model_id)
             return
         self._log(f"{model_id}: stage complete; releasing all dispatched GPU weights")
         self._move_model_to_cpu(model)
+        self._mark_inactive(model_id, model)
         self.offload.loaded_blocks[model_id] = None
         gc.collect()
         for device in self.devices:
@@ -745,18 +771,52 @@ class AccelerateMultiGPU:
             except Exception:
                 pass
 
-    def unload_all(self):
-        for model_id in list(self.dispatched):
-            self.unload(model_id, None)
-        self._release_mmgp()
-        gc.collect()
-        torch.cuda.empty_cache()
+    def unload_all(self, keep=None, *args, **kwargs):
+        # MMGP 3.8.2 may call unload_all(keep=[...]) to preserve cotenants.
+        # Preserve exactly those model ids and release everything else.
+        if keep is None:
+            keep_ids = set()
+        elif isinstance(keep, str):
+            keep_ids = {keep}
+        else:
+            try:
+                keep_ids = set(keep)
+            except TypeError:
+                keep_ids = set()
 
-    def _release_mmgp(self):
+        for model_id in list(self.dispatched):
+            if model_id not in keep_ids:
+                self.unload(model_id, None)
+
+        self._release_mmgp(keep=keep_ids)
+
+        # Defensive cleanup: MMGP can retain stale active ids for models which
+        # were never dispatched due to a failed switch.
+        active_ids = getattr(self.offload, "active_models_ids", None)
+        active_models = getattr(self.offload, "active_models", None)
+        if isinstance(active_ids, list):
+            active_ids[:] = [mid for mid in active_ids if mid in keep_ids]
+        if isinstance(active_models, list):
+            models = getattr(self.offload, "models", {})
+            kept_models = {models[mid] for mid in keep_ids if mid in models}
+            active_models[:] = [m for m in active_models if m in kept_models]
+
+        gc.collect()
+        for device in self.devices:
+            try:
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _release_mmgp(self, keep=None):
+        keep_ids = set(keep or ())
         for model_id in list(self._suspended_mmgp_blocks):
-            self._restore_mmgp_blocks(model_id)
+            if model_id not in keep_ids:
+                self._restore_mmgp_blocks(model_id)
         for model_id in list(self._suspended_mmgp_forwards):
-            self._restore_mmgp_forwards(model_id)
+            if model_id not in keep_ids:
+                self._restore_mmgp_forwards(model_id)
 
     def release(self):
         if not self.installed:
@@ -784,15 +844,19 @@ class AccelerateMultiGPU:
         self._original_release = self.offload.release
 
         self.offload.gpu_load_blocks = types.MethodType(
-            lambda obj, model_id, blocks_name, preload=False: self.load(model_id, blocks_name, preload),
+            lambda obj, model_id, blocks_name, preload=False, *a, **kw:
+                self.load(model_id, blocks_name, preload),
             self.offload,
         )
         self.offload.gpu_unload_blocks = types.MethodType(
-            lambda obj, model_id, blocks_name: self.unload(model_id, blocks_name),
+            lambda obj, model_id, blocks_name=None, *a, **kw:
+                self.unload(model_id, blocks_name, **{
+                    k: v for k, v in kw.items() if k == "cache"
+                }),
             self.offload,
         )
         self.offload.unload_all = types.MethodType(
-            lambda obj: self.unload_all(),
+            lambda obj, *a, **kw: self.unload_all(*a, **kw),
             self.offload,
         )
         self.offload.release = types.MethodType(
