@@ -1,12 +1,10 @@
 """Multi-GPU model sharding for WanGP/MMGP using Hugging Face Accelerate.
 
 MMGP remains responsible for discovering/loading models and model switching.
-Accelerate owns the residency of an active model:
-
-    GPU#0 -> GPU#1 -> ... -> CPU
-
-The active model is dispatched once using Accelerate's device map, allowing
-parameters to reside on multiple GPUs with CPU/RAM as the final tier.
+Accelerate owns the residency of an active model across every configured CUDA
+device. System RAM is not a normal execution tier: MMGP only keeps its original
+file-backed/CPU references so a dispatched model can be restored without a
+second pinned host copy.
 """
 from __future__ import annotations
 
@@ -283,38 +281,72 @@ class AccelerateMultiGPU:
 
 
     def _gemma_device_map(self, model):
-        """GPU-only contiguous Gemma split.
+        """GPU-only contiguous Gemma split using every configured CUDA device.
 
-        The host has only 16 GiB RAM. CPU/disk dispatch is therefore not used
-        for Gemma at all. The checkpoint is already Quanto-quantized and the
-        real model footprint is small enough to split the decoder across the
-        two GPUs. Leave generous VRAM headroom for activations and the rest of
-        Wan2GP instead of filling either card.
+        Keep tied embed_tokens/lm_head together on the primary device and
+        distribute decoder layers proportionally to currently available VRAM.
+        A single contiguous range per GPU minimizes inter-device activation
+        transfers while leaving extra headroom on GPU#0 for embeddings, logits
+        and pipeline activations.
         """
         backbone = getattr(model, "model", None)
         layers = getattr(backbone, "layers", None)
         if layers is None or len(layers) < 2 or len(self.devices) < 2:
             return None
 
-        total = len(layers)
-        split = total // len(self.devices)
+        total_layers = len(layers)
+        usable = []
+        for no, device in enumerate(self.devices):
+            free, _ = torch.cuda.mem_get_info(device.index)
+            reserve = (2.5 if no == 0 else 0.75) * 1024**3
+            usable_bytes = max(256 * 1024**2, int(free * self.fraction) - int(reserve))
+            usable.append(usable_bytes)
+
+        total_usable = max(1, sum(usable))
+        raw = [total_layers * value / total_usable for value in usable]
+        counts = [int(value) for value in raw]
+        remaining = total_layers - sum(counts)
+        order = sorted(
+            range(len(raw)),
+            key=lambda i: (raw[i] - counts[i], usable[i]),
+            reverse=True,
+        )
+        for i in order[:remaining]:
+            counts[i] += 1
+
+        # Use every configured GPU whenever there are enough decoder layers.
+        if total_layers >= len(self.devices):
+            empty = [i for i, count in enumerate(counts) if count == 0]
+            for empty_i in empty:
+                donor = max(range(len(counts)), key=lambda i: counts[i])
+                if counts[donor] > 1:
+                    counts[donor] -= 1
+                    counts[empty_i] += 1
+
         device_map = {
             "model.embed_tokens": self.devices[0],
             "lm_head": self.devices[0],
         }
 
-        for no, device in enumerate(self.devices):
-            begin = no * split
-            end = total if no == len(self.devices) - 1 else (no + 1) * split
-            for i in range(begin, end):
-                device_map[f"model.layers.{i}"] = device
+        cursor = 0
+        for device, count in zip(self.devices, counts):
+            for layer_no in range(cursor, min(total_layers, cursor + count)):
+                device_map[f"model.layers.{layer_no}"] = device
+            cursor += count
+        while cursor < total_layers:
+            device_map[f"model.layers.{cursor}"] = self.devices[-1]
+            cursor += 1
 
-        for name in backbone.named_children():
-            child = name[0]
-            if child != "layers":
+        for child, _ in backbone.named_children():
+            if child not in ("layers", "embed_tokens"):
                 device_map[f"model.{child}"] = self.devices[-1]
 
+        self._log(
+            "Gemma layer split: "
+            + ", ".join(f"{device}={count} layers" for device, count in zip(self.devices, counts))
+        )
         return device_map
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -341,29 +373,14 @@ class AccelerateMultiGPU:
         no_split = self._no_split_classes(model)
         device_map = None
         if getattr(model, "model", None) is not None and getattr(getattr(model, "model", None), "layers", None) is not None:
-            try:
-                from accelerate.utils import get_balanced_memory
-                balanced_memory = get_balanced_memory(
-                    model,
-                    max_memory=self._max_memory(),
-                    no_split_module_classes=no_split,
-                    low_zero=True,
-                )
-                device_map = infer_auto_device_map(
-                    model,
-                    max_memory=balanced_memory,
-                    no_split_module_classes=no_split,
-                    clean_result=True,
-                    offload_buffers=False,
-                    fallback_allocation=True,
-                )
-                if any(str(v) in ("cpu", "disk", "meta") for v in device_map.values()):
-                    device_map = self._gemma_device_map(model)
-            except Exception:
-                device_map = self._gemma_device_map(model)
+            # Gemma has tied input/output embeddings. Letting Accelerate infer
+            # them independently can place embed_tokens and lm_head on
+            # different GPUs, duplicating a very large tied tensor and causing
+            # a delayed OOM in the first pre_forward input transfer.
+            device_map = self._gemma_device_map(model)
 
         if device_map is not None:
-            self._log(f"{model_id}: using Accelerate balanced-low-0 GPU split")
+            self._log(f"{model_id}: using GPU-only weighted contiguous split")
         else:
             # Generic models still use Accelerate's allocator. fallback_allocation
             # is enabled so it can recover from an unlucky first-fit placement.
@@ -421,7 +438,7 @@ class AccelerateMultiGPU:
 
         # Keep Accelerate's standard dispatch path. It handles cross-device
         # activation transfers and tied-parameter bookkeeping.
-        main_device = self.devices[-1] if "cpu" in counts else self.devices[0]
+        main_device = device_map.get("model.embed_tokens", self.devices[0])
         try:
             dispatched = dispatch_model(
                 model,
@@ -457,11 +474,18 @@ class AccelerateMultiGPU:
         model = self.dispatched.pop(model_id, None)
         if model is None:
             return
-        self._log(f"{model_id}: releasing Accelerate dispatch -> RAM")
+        self._log(f"{model_id}: stage complete; releasing all dispatched GPU weights")
         self._move_model_to_cpu(model)
         self.offload.loaded_blocks[model_id] = None
         gc.collect()
-        torch.cuda.empty_cache()
+        for device in self.devices:
+            try:
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+            except Exception:
+                pass
 
     def unload_all(self):
         for model_id in list(self.dispatched):
@@ -517,9 +541,9 @@ class AccelerateMultiGPU:
         )
         self.installed = True
         self._log(
-            "Accelerate multi-GPU: " +
-            " -> ".join(f"GPU#{i}" for i in range(len(self.devices))) +
-            " -> RAM"
+            "Accelerate GPU-first multi-GPU: " +
+            " + ".join(f"GPU#{i}" for i in range(len(self.devices))) +
+            " (RAM is backing/fallback only)"
         )
         for no, device in enumerate(self.devices):
             free, total = torch.cuda.mem_get_info(device.index)
@@ -530,7 +554,7 @@ class AccelerateMultiGPU:
         return self
 
 
-def attach(offload, device_spec: str, fraction: float = 0.82, verbose: int = 1):
+def attach(offload, device_spec: str, fraction: float = 0.92, verbose: int = 1):
     devices = [x.strip() for x in str(device_spec or "").split(",") if x.strip()]
     normalized = [x if x.startswith("cuda:") else f"cuda:{x}" for x in devices]
     if len(normalized) < 2:
