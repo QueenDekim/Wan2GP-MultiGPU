@@ -649,6 +649,11 @@ class AccelerateMultiGPU:
         so keep the quantized wrapper intact.
         """
         try:
+            from optimum.quanto.tensor.qtensor import QTensor as QuantoQTensor
+        except Exception:
+            QuantoQTensor = ()
+
+        try:
             from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
         except Exception:
             WeightQBytesTensor = ()
@@ -658,7 +663,7 @@ class AccelerateMultiGPU:
         except Exception:
             ScaledFP8WeightTensor = ()
 
-        if WeightQBytesTensor == () and ScaledFP8WeightTensor == ():
+        if QuantoQTensor == () and WeightQBytesTensor == () and ScaledFP8WeightTensor == ():
             return
 
         import accelerate.hooks as accelerate_hooks
@@ -714,7 +719,7 @@ class AccelerateMultiGPU:
 
             old_value = getattr(module, tensor_name)
             special_types = tuple(
-                cls for cls in (WeightQBytesTensor, ScaledFP8WeightTensor)
+                cls for cls in (QuantoQTensor, WeightQBytesTensor, ScaledFP8WeightTensor)
                 if isinstance(cls, type)
             )
             if special_types and isinstance(old_value, special_types):
@@ -773,7 +778,7 @@ class AccelerateMultiGPU:
             pass
 
         accelerate_hooks._wgp_quanto_patch = True
-        self._log("Accelerate quantized-tensor compatibility enabled (Quanto + scaled FP8)")
+        self._log("Accelerate quantized-tensor compatibility enabled (Quanto/Wan2GP custom QTensor)")
 
 
     def _gemma_device_map(self, model):
@@ -847,6 +852,26 @@ class AccelerateMultiGPU:
     def _tensor_nbytes(tensor):
         if tensor is None:
             return 0
+
+        # Wan2GP custom quantized wrappers expose their true packed storage
+        # explicitly. Summing those subtensors is more accurate than the
+        # logical wrapper shape/dtype and works for FP8, NF4, NVFP4, GGUF,
+        # W4A8 and Nunchaku tensors.
+        getter = getattr(tensor, "get_quantized_subtensors", None)
+        if callable(getter):
+            try:
+                total = 0
+                seen = set()
+                for _, item in getter():
+                    if not torch.is_tensor(item) or id(item) in seen:
+                        continue
+                    seen.add(id(item))
+                    total += int(item.numel()) * int(item.element_size())
+                if total:
+                    return total
+            except Exception:
+                pass
+
         data = getattr(tensor, "_data", None)
         if torch.is_tensor(data):
             total = int(data.numel()) * int(data.element_size())
@@ -854,6 +879,7 @@ class AccelerateMultiGPU:
             if torch.is_tensor(scale):
                 total += int(scale.numel()) * int(scale.element_size())
             return total
+
         try:
             return int(tensor.numel()) * int(tensor.element_size())
         except Exception:
