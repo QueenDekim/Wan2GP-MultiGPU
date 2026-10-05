@@ -443,6 +443,38 @@ class AccelerateMultiGPU:
             return
 
         original = accelerate_modeling.set_module_tensor_to_device
+        transfer_state = {"calls": 0}
+
+        def maybe_trim_dispatch_working_set(device):
+            # Accelerate streams weights from MMGP's CPU/MMAP backing to CUDA.
+            # Keep the process working set bounded while that streaming is in
+            # progress instead of letting Windows retain every touched page.
+            transfer_state["calls"] += 1
+            if transfer_state["calls"] % 8:
+                return
+            try:
+                import psutil
+                process = psutil.Process(os.getpid())
+                rss = process.memory_info().rss
+                available = psutil.virtual_memory().available
+                total = psutil.virtual_memory().total
+                pressure = (
+                    rss >= 3 * 1024**3
+                    or available <= max(2 * 1024**3, int(total * 0.15))
+                )
+            except Exception:
+                pressure = False
+
+            if not pressure:
+                return
+
+            # Ensure any H2D read from the CPU backing completed before those
+            # pages are made reclaimable by EmptyWorkingSet.
+            try:
+                torch.cuda.current_stream(torch.device(device)).synchronize()
+            except Exception:
+                pass
+            self._trim_host_working_set("Accelerate tensor streaming")
 
         def set_module_tensor_to_device_compat(
             module, tensor_name, device, value=None, dtype=None,
@@ -471,11 +503,13 @@ class AccelerateMultiGPU:
                     new_value = old_value.to(device, non_blocking=non_blocking)
 
                 module._parameters[tensor_name] = new_value
-                if clear_cache and torch.device(device).type == "cuda":
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                if torch.device(device).type == "cuda":
+                    maybe_trim_dispatch_working_set(device)
+                    if clear_cache:
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                 return
 
             return original(
