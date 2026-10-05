@@ -297,27 +297,38 @@ def _register_ops():
 
 
 def kitchen_linear(input, weight, bias=None, *, convrot=False):
-    if convrot and _direct_cutlass and input.shape[-1] > 16384:
-        if (_wide_convrot_triton is not None and not torch.compiler.is_compiling()
-                and not triton._is_fake_tensor(input)):
-            return _wide_convrot_linear(input, weight, bias)
-        # The wide cuBLAS path cannot be captured on validated SM120. Keep a
-        # graph-safe Quanto fallback when Triton is unavailable.
-        from shared.qtypes.int8_convrot import _rotate_activation
-        return torch.nn.functional.linear(_rotate_activation(input, 256), weight, bias)
-    scale = triton._prepare_weight_scale(weight._scale, weight.shape[0], input.device)
-    x = input.reshape(-1, input.shape[-1])
-    if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
-        out = torch.ops.wan2gp_kitchen.linear(x, weight._data, scale, bias, convrot)
-    else:
-        out = _linear_impl(x, weight._data, scale, bias, convrot)
-    return out.reshape(*input.shape[:-1], weight.shape[0])
+    # Comfy Kitchen exports CUDA tensors through DLPack and validates against
+    # torch.cuda.current_device(). With Accelerate model sharding the active
+    # layer may live on cuda:1+ while the process-wide current device remains
+    # cuda:0. Always execute the whole kernel path in the input tensor's CUDA
+    # context so DLPack, streams and temporary allocations use the same GPU.
+    device = input.device
+    if device.type != "cuda":
+        raise RuntimeError(f"Comfy Kitchen INT8 expected a CUDA input, got {device}")
+
+    with torch.cuda.device(device):
+        if convrot and _direct_cutlass and input.shape[-1] > 16384:
+            if (_wide_convrot_triton is not None and not torch.compiler.is_compiling()
+                    and not triton._is_fake_tensor(input)):
+                return _wide_convrot_linear(input, weight, bias)
+            # The wide cuBLAS path cannot be captured on validated SM120. Keep a
+            # graph-safe Quanto fallback when Triton is unavailable.
+            from shared.qtypes.int8_convrot import _rotate_activation
+            return torch.nn.functional.linear(_rotate_activation(input, 256), weight, bias)
+        scale = triton._prepare_weight_scale(weight._scale, weight.shape[0], device)
+        x = input.reshape(-1, input.shape[-1])
+        if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
+            out = torch.ops.wan2gp_kitchen.linear(x, weight._data, scale, bias, convrot)
+        else:
+            out = _linear_impl(x, weight._data, scale, bias, convrot)
+        return out.reshape(*input.shape[:-1], weight.shape[0])
 
 
 def _quanto_forward(ctx, input, weight, bias=None):
     if (type(input) is torch.Tensor and input.is_cuda
             and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and weight._data.is_cuda and weight._data.dtype == torch.int8
+            and weight._data.device == input.device
             and (input.shape[-1] <= 16384 or not _direct_cutlass)
             and (not _kitchen_hip or weight.shape[-1] % 16 == 0)):
         ctx.save_for_backward(input, weight)
