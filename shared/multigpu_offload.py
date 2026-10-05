@@ -717,6 +717,174 @@ class AccelerateMultiGPU:
         )
         return device_map
 
+    @staticmethod
+    def _tensor_nbytes(tensor):
+        if tensor is None:
+            return 0
+        try:
+            return int(tensor.numel()) * int(tensor.element_size())
+        except Exception:
+            data = getattr(tensor, "_data", None)
+            try:
+                return int(data.numel()) * int(data.element_size())
+            except Exception:
+                return 0
+
+    def _module_nbytes(self, module):
+        """Approximate resident bytes without following external backrefs."""
+        total = 0
+        seen = set()
+        for submodule in self._iter_modules_unique(module):
+            for parameter in getattr(submodule, "_parameters", {}).values():
+                if parameter is None or id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                total += self._tensor_nbytes(parameter)
+            for buffer in getattr(submodule, "_buffers", {}).values():
+                if buffer is None or id(buffer) in seen:
+                    continue
+                seen.add(id(buffer))
+                total += self._tensor_nbytes(buffer)
+        return total
+
+    def _ltx2_device_map(self, model):
+        """GPU-only weighted contiguous split for LTX2 X0Model.
+
+        Accelerate generic inference can fall back to disk for the quantized
+        X0Model even when aggregate CUDA VRAM is sufficient. LTX2 has an
+        explicit sequential transformer_blocks pipeline, so place those blocks
+        in contiguous ranges weighted by each GPU current usable VRAM.
+        """
+        velocity_model = getattr(model, "velocity_model", None)
+        blocks = getattr(velocity_model, "transformer_blocks", None)
+        if velocity_model is None or blocks is None or len(blocks) < 2 or len(self.devices) < 2:
+            return None
+
+        block_sizes = [max(1, self._module_nbytes(block)) for block in blocks]
+        total_block_bytes = sum(block_sizes)
+
+        block_ids = {id(block) for block in blocks}
+        support_bytes = 0
+        seen_tensors = set()
+
+        for parameter in getattr(velocity_model, "_parameters", {}).values():
+            if parameter is not None and id(parameter) not in seen_tensors:
+                seen_tensors.add(id(parameter))
+                support_bytes += self._tensor_nbytes(parameter)
+        for buffer in getattr(velocity_model, "_buffers", {}).values():
+            if buffer is not None and id(buffer) not in seen_tensors:
+                seen_tensors.add(id(buffer))
+                support_bytes += self._tensor_nbytes(buffer)
+        for child_name, child in getattr(velocity_model, "_modules", {}).items():
+            if child is None or child_name == "transformer_blocks" or id(child) in block_ids:
+                continue
+            support_bytes += self._module_nbytes(child)
+
+        usable = []
+        free_now = []
+        for no, device in enumerate(self.devices):
+            free, _ = torch.cuda.mem_get_info(device.index)
+            free_now.append(int(free))
+            budget = int(free * self.fraction)
+            reserve_gib = 1.50 if no == 0 else 0.75
+            budget -= int(reserve_gib * 1024**3)
+            if no == 0:
+                budget -= support_bytes
+            usable.append(max(256 * 1024**2, budget))
+
+        if sum(usable) < total_block_bytes:
+            self._log(
+                "LTX2 GPU-only map is tight: "
+                f"{total_block_bytes / 1024**3:.2f} GiB block weights vs "
+                f"{sum(usable) / 1024**3:.2f} GiB profiled block capacity; "
+                "using all available GPUs without host/disk offload"
+            )
+
+        total_usable = max(1, sum(usable))
+        cumulative_targets = []
+        running_usable = 0
+        for value in usable[:-1]:
+            running_usable += value
+            cumulative_targets.append(total_block_bytes * running_usable / total_usable)
+
+        boundaries = []
+        running_bytes = 0
+        target_no = 0
+        for block_no, size in enumerate(block_sizes):
+            if target_no >= len(cumulative_targets):
+                break
+            target = cumulative_targets[target_no]
+            before = running_bytes
+            after = running_bytes + size
+            blocks_left_after = len(block_sizes) - (block_no + 1)
+            gpus_left = len(self.devices) - (target_no + 1)
+            must_cut = blocks_left_after == gpus_left
+            crossed = after >= target
+            if must_cut or crossed:
+                cut_after = block_no + 1
+                previous_cut = boundaries[-1] if boundaries else 0
+                if (
+                    not must_cut
+                    and block_no > previous_cut
+                    and abs(target - before) < abs(after - target)
+                ):
+                    cut_after = block_no
+                min_cut = previous_cut + 1
+                max_cut = len(block_sizes) - gpus_left
+                cut_after = max(min_cut, min(cut_after, max_cut))
+                boundaries.append(cut_after)
+                target_no += 1
+            running_bytes = after
+
+        while len(boundaries) < len(self.devices) - 1:
+            previous = boundaries[-1] if boundaries else 0
+            remaining_gpus = len(self.devices) - 1 - len(boundaries)
+            boundaries.append(min(len(block_sizes) - remaining_gpus, previous + 1))
+
+        ranges = []
+        start = 0
+        for end in boundaries + [len(block_sizes)]:
+            ranges.append((start, end))
+            start = end
+
+        device_map = {}
+        for name, parameter in getattr(velocity_model, "_parameters", {}).items():
+            if parameter is not None:
+                device_map[f"velocity_model.{name}"] = self.devices[0]
+        for name, buffer in getattr(velocity_model, "_buffers", {}).items():
+            if buffer is not None:
+                device_map[f"velocity_model.{name}"] = self.devices[0]
+
+        for child_name, child in getattr(velocity_model, "_modules", {}).items():
+            if child is None or child_name == "transformer_blocks":
+                continue
+            device_map[f"velocity_model.{child_name}"] = self.devices[0]
+
+        range_logs = []
+        for device, (start, end) in zip(self.devices, ranges):
+            bytes_on_device = 0
+            for block_no in range(start, end):
+                device_map[f"velocity_model.transformer_blocks.{block_no}"] = device
+                bytes_on_device += block_sizes[block_no]
+            range_logs.append(
+                f"{device}=blocks {start}-{end - 1} "
+                f"({bytes_on_device / 1024**3:.2f} GiB weights)"
+            )
+
+        self._log("LTX2 weighted contiguous split: " + ", ".join(range_logs))
+        if self.verbose >= 2:
+            self._log(
+                "LTX2 primary support weights: "
+                f"{support_bytes / 1024**3:.2f} GiB on {self.devices[0]}"
+            )
+            self._log(
+                "LTX2 current free VRAM: "
+                + ", ".join(
+                    f"{device}={free / 1024**3:.2f} GiB"
+                    for device, free in zip(self.devices, free_now)
+                )
+            )
+        return device_map
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -750,6 +918,13 @@ class AccelerateMultiGPU:
             # different GPUs, duplicating a very large tied tensor and causing
             # a delayed OOM in the first pre_forward input transfer.
             device_map = self._gemma_device_map(model)
+        elif (
+            getattr(model, "velocity_model", None) is not None
+            and getattr(getattr(model, "velocity_model", None), "transformer_blocks", None) is not None
+        ):
+            # LTX2 X0Model is a sequential block pipeline. Use an explicit
+            # GPU-only split because generic inference may choose disk.
+            device_map = self._ltx2_device_map(model)
 
         if device_map is not None:
             self._log(f"{model_id}: using GPU-only weighted contiguous split")
@@ -792,6 +967,12 @@ class AccelerateMultiGPU:
                 "model.layers.47",
                 "lm_head",
                 "model.norm",
+                "velocity_model.patchify_proj",
+                "velocity_model.transformer_blocks.0",
+                "velocity_model.transformer_blocks.23",
+                "velocity_model.transformer_blocks.24",
+                "velocity_model.transformer_blocks.47",
+                "velocity_model.proj_out",
             ):
                 if name in device_map:
                     self._log(f"{model_id}: {name} -> {device_map[name]}")
