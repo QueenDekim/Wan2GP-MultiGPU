@@ -4200,15 +4200,21 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         if compile_modules == False and len(compile):
             _load_models_info("Pytorch compilation is not supported for this Model")
         if args.multigpu:
-            # Two 16 GiB GPUs + a 16 GiB host cannot afford MMGP's normal
-            # reserved-RAM copy. Profile 4 pins the transformer by default
-            # (the run can reserve ~5-6 GiB before generation), so MultiGPU
-            # explicitly disables RAM pinning and async prefetching.
+            # MultiGPU is GPU-first. Keep MMGP host memory as a tiny mmap/backing
+            # tier only; active model weights are owned by Accelerate on CUDA.
+            # MMGP treats perc_reserved_mem_max <= 0 as "use platform default"
+            # (40% on Windows), so use a small *positive* value to really cap
+            # reserved/pinned host memory.
             kwargs["pinnedMemory"] = False
             kwargs["pinnedPEFTLora"] = False
             kwargs["asyncTransfers"] = False
             kwargs["partialPinning"] = False
-            print("[MultiGPU] Host RAM mode: no pinned model copies / no async RAM prefetch", flush=True)
+            perc_reserved_mem_max = 0.01
+            print(
+                "[MultiGPU] GPU-first host mode: pinning/prefetch disabled; "
+                "reserved RAM capped at 1%",
+                flush=True,
+            )
         offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, perc_reserved_mem_max = perc_reserved_mem_max , vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
     if args.multigpu:
         multigpu_devices = [x.strip() for x in args.multigpu.split(",") if x.strip()]
