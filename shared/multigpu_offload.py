@@ -132,6 +132,16 @@ class AccelerateMultiGPU:
                     pass
 
         for module in model.modules():
+            # Do not call Accelerate's normal detach path here: for Quanto it
+            # may materialize a meta tensor on CPU and transiently duplicate a
+            # large weight. Restore the original forward callable directly.
+            old_forward = getattr(module, "_old_forward", None)
+            if old_forward is not None:
+                try:
+                    module.forward = old_forward
+                    delattr(module, "_old_forward")
+                except Exception:
+                    pass
             if hasattr(module, "_hf_hook"):
                 try:
                     delattr(module, "_hf_hook")
