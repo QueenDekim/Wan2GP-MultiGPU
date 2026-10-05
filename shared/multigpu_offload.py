@@ -50,9 +50,11 @@ class AccelerateMultiGPU:
         wrapper = getattr(forward, "func", forward)
         wrapper_module = getattr(wrapper, "__module__", "") or ""
         wrapper_name = getattr(wrapper, "__name__", "") or ""
+        # Only strip MMGP *offload* wrappers. MMGP also owns LoRA forward
+        # wrappers (_mm_lora_*); those must remain active because they apply
+        # the adapter math after Accelerate places the base layer.
         is_mmgp = (
-            wrapper_module == "mmgp.offload"
-            or wrapper_name.startswith("check_load_into_GPU_needed")
+            wrapper_name.startswith("check_load_into_GPU_needed")
             or wrapper_name.startswith("check_change_module")
             or wrapper_name.startswith("_mm_wrap_")
         )
@@ -134,6 +136,98 @@ class AccelerateMultiGPU:
         elif self.verbose >= 2:
             self._log(f"{model_id}: Accelerate _old_forward verified clean of MMGP hooks")
 
+    @staticmethod
+    def _module_device(module):
+        weight = getattr(module, "weight", None)
+        device = getattr(weight, "device", None) if weight is not None else None
+        if device is not None and torch.device(device).type != "meta":
+            return torch.device(device)
+        param = next(module.parameters(recurse=False), None)
+        if param is not None and param.device.type != "meta":
+            return param.device
+        return None
+
+    def _load_loras_for_dispatch(self, model_id, model):
+        """Place active LoRA tensors beside each sharded base layer."""
+        active = list(getattr(model, "_loras_active_adapters", None) or [])
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not active or not loras_model_data:
+            return
+
+        shortcuts = getattr(model, "_loras_model_shortcuts", None) or {}
+        tensor_cache = {}
+        alias_cache = {}
+        moved_bytes = 0
+        moved_modules = 0
+
+        def move_tensor(item, device):
+            nonlocal moved_bytes
+            if item is None:
+                return None
+            if torch.is_tensor(item):
+                key = (id(item), str(device))
+                moved = tensor_cache.get(key)
+                if moved is None:
+                    moved = item.to(device, non_blocking=True)
+                    tensor_cache[key] = moved
+                    try:
+                        moved_bytes += moved.numel() * moved.element_size()
+                    except Exception:
+                        pass
+                return moved
+            return item
+
+        def resolve_alias(value, adapter, device):
+            if not isinstance(value, str):
+                return move_tensor(value, device)
+            cache_key = (adapter, value, str(device))
+            if cache_key in alias_cache:
+                return alias_cache[cache_key]
+            seen = set()
+            while isinstance(value, str):
+                if value in seen or "#" not in value:
+                    return None
+                seen.add(value)
+                target, slot = value.rsplit("#", 1)
+                target_data = shortcuts.get(target)
+                if target_data is None or adapter not in target_data:
+                    return None
+                value = target_data[adapter][int(slot)]
+            resolved = move_tensor(value, device)
+            alias_cache[cache_key] = resolved
+            return resolved
+
+        for module, adapters in loras_model_data.items():
+            device = self._module_device(module)
+            if device is None or device.type != "cuda":
+                continue
+            touched = False
+            for adapter in active:
+                source = adapters.get(adapter)
+                if source is None:
+                    continue
+                moved = list(source)
+                for slot in range(min(4, len(moved))):
+                    moved[slot] = resolve_alias(moved[slot], adapter, device)
+                adapters[adapter + "_GPU"] = moved
+                touched = True
+            if touched:
+                moved_modules += 1
+
+        if moved_modules:
+            self._log(
+                f"{model_id}: LoRA GPU residency prepared for {moved_modules} module(s), "
+                f"{moved_bytes / 1024**2:.1f} MiB copied across shard devices"
+            )
+
+    def _unload_dispatched_loras(self, model):
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not loras_model_data:
+            return
+        for adapters in loras_model_data.values():
+            for key in [key for key in adapters if isinstance(key, str) and key.endswith("_GPU")]:
+                del adapters[key]
+
     def _remove_accelerate_hooks(self, model):
         try:
             from accelerate.hooks import remove_hook_from_submodules
@@ -165,6 +259,8 @@ class AccelerateMultiGPU:
             if candidate is model:
                 model_id = candidate_id
                 break
+
+        self._unload_dispatched_loras(model)
 
         original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
         if model_id is not None:
@@ -503,6 +599,7 @@ class AccelerateMultiGPU:
                 force_hooks=True,
             )
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
+            self._load_loras_for_dispatch(model_id, dispatched)
             dispatched.hf_device_map = device_map
         except Exception:
             # Never leave MMGP with a disabled block registry if Accelerate
