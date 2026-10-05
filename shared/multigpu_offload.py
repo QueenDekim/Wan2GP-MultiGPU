@@ -764,21 +764,38 @@ class AccelerateMultiGPU:
         total_block_bytes = sum(block_sizes)
 
         block_ids = {id(block) for block in blocks}
-        support_bytes = 0
+        output_param_names = {"scale_shift_table", "audio_scale_shift_table"}
+        output_child_names = {"norm_out", "proj_out", "audio_norm_out", "audio_proj_out"}
+        primary_support_bytes = 0
+        terminal_support_bytes = 0
         seen_tensors = set()
 
-        for parameter in getattr(velocity_model, "_parameters", {}).values():
-            if parameter is not None and id(parameter) not in seen_tensors:
-                seen_tensors.add(id(parameter))
-                support_bytes += self._tensor_nbytes(parameter)
-        for buffer in getattr(velocity_model, "_buffers", {}).values():
-            if buffer is not None and id(buffer) not in seen_tensors:
-                seen_tensors.add(id(buffer))
-                support_bytes += self._tensor_nbytes(buffer)
+        for name, parameter in getattr(velocity_model, "_parameters", {}).items():
+            if parameter is None or id(parameter) in seen_tensors:
+                continue
+            seen_tensors.add(id(parameter))
+            size = self._tensor_nbytes(parameter)
+            if name in output_param_names:
+                terminal_support_bytes += size
+            else:
+                primary_support_bytes += size
+        for name, buffer in getattr(velocity_model, "_buffers", {}).items():
+            if buffer is None or id(buffer) in seen_tensors:
+                continue
+            seen_tensors.add(id(buffer))
+            size = self._tensor_nbytes(buffer)
+            if name in output_param_names:
+                terminal_support_bytes += size
+            else:
+                primary_support_bytes += size
         for child_name, child in getattr(velocity_model, "_modules", {}).items():
             if child is None or child_name == "transformer_blocks" or id(child) in block_ids:
                 continue
-            support_bytes += self._module_nbytes(child)
+            size = self._module_nbytes(child)
+            if child_name in output_child_names:
+                terminal_support_bytes += size
+            else:
+                primary_support_bytes += size
 
         usable = []
         free_now = []
@@ -789,7 +806,9 @@ class AccelerateMultiGPU:
             reserve_gib = 1.50 if no == 0 else 0.75
             budget -= int(reserve_gib * 1024**3)
             if no == 0:
-                budget -= support_bytes
+                budget -= primary_support_bytes
+            if no == len(self.devices) - 1:
+                budget -= terminal_support_bytes
             usable.append(max(256 * 1024**2, budget))
 
         if sum(usable) < total_block_bytes:
@@ -848,17 +867,24 @@ class AccelerateMultiGPU:
             start = end
 
         device_map = {}
+        last_device = self.devices[-1]
         for name, parameter in getattr(velocity_model, "_parameters", {}).items():
             if parameter is not None:
-                device_map[f"velocity_model.{name}"] = self.devices[0]
+                device_map[f"velocity_model.{name}"] = (
+                    last_device if name in output_param_names else self.devices[0]
+                )
         for name, buffer in getattr(velocity_model, "_buffers", {}).items():
             if buffer is not None:
-                device_map[f"velocity_model.{name}"] = self.devices[0]
+                device_map[f"velocity_model.{name}"] = (
+                    last_device if name in output_param_names else self.devices[0]
+                )
 
         for child_name, child in getattr(velocity_model, "_modules", {}).items():
             if child is None or child_name == "transformer_blocks":
                 continue
-            device_map[f"velocity_model.{child_name}"] = self.devices[0]
+            device_map[f"velocity_model.{child_name}"] = (
+                last_device if child_name in output_child_names else self.devices[0]
+            )
 
         range_logs = []
         for device, (start, end) in zip(self.devices, ranges):
@@ -874,8 +900,9 @@ class AccelerateMultiGPU:
         self._log("LTX2 weighted contiguous split: " + ", ".join(range_logs))
         if self.verbose >= 2:
             self._log(
-                "LTX2 primary support weights: "
-                f"{support_bytes / 1024**3:.2f} GiB on {self.devices[0]}"
+                "LTX2 support weights: "
+                f"{primary_support_bytes / 1024**3:.2f} GiB on {self.devices[0]}, "
+                f"{terminal_support_bytes / 1024**3:.2f} GiB output heads on {self.devices[-1]}"
             )
             self._log(
                 "LTX2 current free VRAM: "
