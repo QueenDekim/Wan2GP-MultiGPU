@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Tuple
 
@@ -64,6 +64,36 @@ class RopeCache:
 
     def is_grid(self) -> bool:
         return self.rope_axes is not None and bool(self.layouts)
+
+    def to(self, device, non_blocking: bool = False):
+        """Move cached RoPE tensors once when a MultiGPU shard boundary is crossed."""
+        device = torch.device(device)
+
+        def move_tensor(tensor):
+            if tensor.device == device:
+                return tensor
+            return tensor.to(device=device, non_blocking=non_blocking)
+
+        axes = tuple(
+            RopeAxisCache(
+                values=move_tensor(axis.values),
+                cos=move_tensor(axis.cos),
+                sin=move_tensor(axis.sin),
+            )
+            for axis in self.axes
+        )
+        layouts = tuple(
+            RopeLayoutCache(
+                token_start=layout.token_start,
+                token_stop=layout.token_stop,
+                grid_sizes=layout.grid_sizes,
+                axis_cos=tuple(move_tensor(t) for t in layout.axis_cos),
+                axis_sin=tuple(move_tensor(t) for t in layout.axis_sin),
+                axis_token_indices=tuple(move_tensor(t) for t in layout.axis_token_indices),
+            )
+            for layout in self.layouts
+        )
+        return replace(self, axes=axes, layouts=layouts)
 
 
 def apply_rotary_emb_inplace(
