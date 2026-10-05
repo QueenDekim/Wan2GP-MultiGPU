@@ -383,34 +383,63 @@ class AccelerateMultiGPU:
                 self._log(f"Host working set trimmed{suffix}")
 
     def _ensure_state_dict_compat(self, model_id, model):
-        """Repair MMGP Quanto state_dict monkey-patch for standard PyTorch calls."""
-        real_state_dict = getattr(model, "_real_state_dict", None)
-        if not callable(real_state_dict) or getattr(model, "_wgp_state_dict_compat", False):
-            return
+        """Repair every MMGP Quanto state_dict monkey-patch in the module graph.
 
+        MMGP may install _quantize_dirty_hack on nested quantized modules, not
+        just on the root model. PyTorch state_dict() recursively calls each
+        child with destination/prefix/keep_vars, so every patched module must
+        honor the normal nn.Module.state_dict signature.
+        """
         import traceback
         from collections import OrderedDict
 
-        def state_dict_compat(*args, **kwargs):
-            real_sd = real_state_dict(*args, **kwargs)
-            # destination/prefix/keep_vars means this is a standard PyTorch
-            # recursive state_dict call (Accelerate relies on this contract).
-            if args or kwargs:
-                return real_sd
-            fakeit = any("_lora_" in frame.name for frame in traceback.extract_stack(limit=6))
-            if not fakeit:
-                return real_sd
-            sd = OrderedDict()
-            for key, value in real_sd.items():
-                if key.endswith("._data"):
-                    key = key[:-6]
-                sd[key] = value
-            return sd
+        repaired = 0
 
-        model.state_dict = state_dict_compat
-        model._wgp_state_dict_compat = True
-        if self.verbose >= 2:
-            self._log(f"{model_id}: repaired MMGP state_dict signature for Accelerate")
+        def make_compat(module, real_state_dict):
+            def state_dict_compat(*args, **kwargs):
+                real_sd = real_state_dict(*args, **kwargs)
+
+                # Recursive PyTorch / Accelerate calls pass destination,
+                # prefix and/or keep_vars. Preserve that contract exactly.
+                if args or kwargs:
+                    return real_sd
+
+                # MMGP's fake non-quantized key view is only required for the
+                # LoRA initialization path that originally motivated the hack.
+                fakeit = any(
+                    "_lora_" in frame.name
+                    for frame in traceback.extract_stack(limit=8)
+                )
+                if not fakeit:
+                    return real_sd
+
+                sd = OrderedDict()
+                for key, value in real_sd.items():
+                    if key.endswith("._data"):
+                        key = key[:-6]
+                    sd[key] = value
+                return sd
+
+            return state_dict_compat
+
+        for module in self._iter_modules_unique(model):
+            if getattr(module, "_wgp_state_dict_compat", False):
+                continue
+            real_state_dict = getattr(module, "_real_state_dict", None)
+            if not callable(real_state_dict):
+                continue
+            try:
+                module.state_dict = make_compat(module, real_state_dict)
+                module._wgp_state_dict_compat = True
+                repaired += 1
+            except Exception:
+                pass
+
+        if repaired and self.verbose >= 2:
+            self._log(
+                f"{model_id}: repaired MMGP state_dict signature on "
+                f"{repaired} module(s)"
+            )
 
     def _capture_original_tensor_backing(self, model_id, model):
         """Keep references to existing CPU/MMAP tensors before CUDA dispatch."""
@@ -1100,10 +1129,27 @@ class AccelerateMultiGPU:
             # now instead of waiting until the stage finishes.
             self._trim_host_working_set(f"{model_id} GPU dispatch")
         except Exception:
-            # Never leave MMGP with a disabled block registry if Accelerate
-            # fails during dispatch.
-            self._restore_mmgp_blocks(model_id)
-            self._restore_mmgp_forwards(model_id)
+            # dispatch_model mutates modules in-place as it progresses. Roll
+            # the model all the way back to MMGP's original CPU/MMAP backing
+            # instead of only restoring hook registries; otherwise a failed
+            # dispatch can leak CUDA tensors or leave partial HF hooks behind.
+            try:
+                self._move_model_to_cpu(model)
+            except Exception:
+                self._restore_original_tensor_backing(model_id)
+                self._remove_accelerate_hooks(model)
+                self._restore_mmgp_blocks(model_id)
+                self._restore_mmgp_forwards(model_id)
+
+            gc.collect()
+            for device in self.devices:
+                try:
+                    with torch.cuda.device(device):
+                        torch.cuda.empty_cache()
+                        if hasattr(torch.cuda, "ipc_collect"):
+                            torch.cuda.ipc_collect()
+                except Exception:
+                    pass
             raise
 
         self.dispatched[model_id] = dispatched
