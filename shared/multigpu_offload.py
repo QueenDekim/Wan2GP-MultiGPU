@@ -380,13 +380,13 @@ class AccelerateMultiGPU:
             for key in [key for key in adapters if isinstance(key, str) and key.endswith("_GPU")]:
                 del adapters[key]
 
-    def _install_ltx2_jit_loras(self, model_id, model):
-        """Use one-transformer-block-at-a-time LoRA residency when VRAM is tight."""
+    def _install_block_jit_loras(self, model_id, model):
+        """Use one-block-at-a-time LoRA residency for any known block pipeline."""
         active = list(getattr(model, "_loras_active_adapters", None) or [])
         loras_model_data = getattr(model, "_loras_model_data", None)
-        velocity_model = getattr(model, "velocity_model", None)
-        blocks = getattr(velocity_model, "transformer_blocks", None)
-        if not active or not loras_model_data or blocks is None or not len(blocks):
+        stages = self._block_pipeline_stages(model)
+        blocks = [block for _, stage_blocks, _ in stages for block in stage_blocks]
+        if not active or not loras_model_data or not blocks:
             return False
 
         full_bytes = self._lora_bytes_by_device(model)
@@ -885,6 +885,10 @@ class AccelerateMultiGPU:
             "LTXVTransformerBlock",
             "LTXTransformerBlock",
             "Gemma3DecoderLayer",
+            "LlamaDecoderLayer",
+            "Qwen2DecoderLayer",
+            "Qwen2VLDecoderLayer",
+            "Qwen2_5_VLDecoderLayer",
             "WanTransformerBlock",
             "Wan2TransformerBlock",
         }
@@ -1157,6 +1161,253 @@ class AccelerateMultiGPU:
                 total += self._tensor_nbytes(buffer)
         return total
 
+    def _block_pipeline_stages(self, model):
+        """Return ordered whole-block stages for known WanGP transformer families."""
+        velocity_model = getattr(model, "velocity_model", None)
+        if velocity_model is not None and getattr(velocity_model, "transformer_blocks", None) is not None:
+            return [("velocity_model.transformer_blocks", velocity_model.transformer_blocks, "LTX2")]
+
+        if (
+            getattr(model, "transformer_blocks", None) is not None
+            and getattr(model, "patchify_proj", None) is not None
+            and getattr(model, "adaln_single", None) is not None
+        ):
+            return [("transformer_blocks", model.transformer_blocks, "LTX-Video")]
+
+        if (
+            getattr(model, "blocks", None) is not None
+            and getattr(model, "patch_embedding", None) is not None
+            and getattr(model, "head", None) is not None
+        ):
+            return [("blocks", model.blocks, "Wan")]
+
+        if getattr(model, "double_blocks", None) is not None and getattr(model, "final_layer", None) is not None:
+            stages = [("double_blocks", model.double_blocks, "Hunyuan")]
+            single = getattr(model, "single_blocks", None)
+            if single is not None and len(single):
+                stages.append(("single_blocks", single, "Hunyuan"))
+            return stages
+
+        if getattr(model, "visual_transformer_blocks", None) is not None and getattr(model, "out_layer", None) is not None:
+            stages = []
+            text_blocks = getattr(model, "text_transformer_blocks", None)
+            if text_blocks is not None and len(text_blocks):
+                stages.append(("text_transformer_blocks", text_blocks, "Kandinsky5"))
+            stages.append(("visual_transformer_blocks", model.visual_transformer_blocks, "Kandinsky5"))
+            return stages
+
+        return []
+
+    def _weighted_top_level_pipeline_map(self, model):
+        """GPU-only map for Wan/LTX-Video/Hunyuan/Kandinsky block pipelines.
+
+        Only whole transformer blocks are sharded. All preprocessing, direct
+        parameters and output modules stay on cuda:0, so model-specific root
+        forward code always begins and ends on the primary GPU.
+        """
+        stages = self._block_pipeline_stages(model)
+        if not stages or stages[0][0].startswith("velocity_model."):
+            return None
+
+        flattened = []
+        for path, blocks, _ in stages:
+            for index, block in enumerate(blocks):
+                flattened.append((f"{path}.{index}", block))
+        if len(flattened) < len(self.devices):
+            return None
+
+        block_sizes = [max(1, self._module_nbytes(block)) for _, block in flattened]
+        total_block_bytes = sum(block_sizes)
+        stage_roots = {path.split(".", 1)[0] for path, _, _ in stages}
+
+        primary_support_bytes = 0
+        seen = set()
+        for value in getattr(model, "_parameters", {}).values():
+            if value is not None and id(value) not in seen:
+                seen.add(id(value))
+                primary_support_bytes += self._tensor_nbytes(value)
+        for value in getattr(model, "_buffers", {}).values():
+            if value is not None and id(value) not in seen:
+                seen.add(id(value))
+                primary_support_bytes += self._tensor_nbytes(value)
+        for child_name, child in getattr(model, "_modules", {}).items():
+            if child is None or child_name in stage_roots:
+                continue
+            primary_support_bytes += self._module_nbytes(child)
+
+        reserve = self._profile_activation_reserve_bytes()
+        usable = []
+        free_now = []
+        for no, device in enumerate(self.devices):
+            free, _ = torch.cuda.mem_get_info(device.index)
+            free_now.append(int(free))
+            budget = int(free * self.fraction) - reserve
+            if no == 0:
+                budget -= primary_support_bytes
+            usable.append(max(256 * 1024**2, budget))
+
+        if sum(usable) < total_block_bytes:
+            self._log(
+                f"{stages[0][2]} GPU-only map is tight: "
+                f"{total_block_bytes / 1024**3:.2f} GiB block weights vs "
+                f"{sum(usable) / 1024**3:.2f} GiB profiled capacity"
+            )
+
+        total_usable = max(1, sum(usable))
+        cumulative_targets = []
+        running = 0
+        for value in usable[:-1]:
+            running += value
+            cumulative_targets.append(total_block_bytes * running / total_usable)
+
+        boundaries = []
+        running_bytes = 0
+        target_no = 0
+        for block_no, size in enumerate(block_sizes):
+            if target_no >= len(cumulative_targets):
+                break
+            before = running_bytes
+            after = running_bytes + size
+            target = cumulative_targets[target_no]
+            blocks_left_after = len(block_sizes) - block_no - 1
+            gpus_left = len(self.devices) - target_no - 1
+            must_cut = blocks_left_after == gpus_left
+            if must_cut or after >= target:
+                previous_cut = boundaries[-1] if boundaries else 0
+                cut_after = block_no + 1
+                if (
+                    not must_cut
+                    and block_no > previous_cut
+                    and abs(target - before) < abs(after - target)
+                ):
+                    cut_after = block_no
+                cut_after = max(previous_cut + 1, min(cut_after, len(block_sizes) - gpus_left))
+                boundaries.append(cut_after)
+                target_no += 1
+            running_bytes = after
+
+        while len(boundaries) < len(self.devices) - 1:
+            previous = boundaries[-1] if boundaries else 0
+            remaining = len(self.devices) - 1 - len(boundaries)
+            boundaries.append(min(len(block_sizes) - remaining, previous + 1))
+
+        ranges = []
+        start = 0
+        for end in boundaries + [len(block_sizes)]:
+            ranges.append((start, end))
+            start = end
+
+        device_map = {}
+        # Direct root tensors and every non-block child stay on the primary.
+        for name, value in getattr(model, "_parameters", {}).items():
+            if value is not None:
+                device_map[name] = self.devices[0]
+        for name, value in getattr(model, "_buffers", {}).items():
+            if value is not None:
+                device_map[name] = self.devices[0]
+        for child_name, child in getattr(model, "_modules", {}).items():
+            if child is None or child_name in stage_roots:
+                continue
+            device_map[child_name] = self.devices[0]
+
+        range_logs = []
+        for device, (start, end) in zip(self.devices, ranges):
+            bytes_on_device = 0
+            names = []
+            for index in range(start, end):
+                path, _ = flattened[index]
+                device_map[path] = device
+                bytes_on_device += block_sizes[index]
+                names.append(path)
+            short_first = names[0] if names else "-"
+            short_last = names[-1] if names else "-"
+            range_logs.append(
+                f"{device}={short_first}..{short_last} "
+                f"({bytes_on_device / 1024**3:.2f} GiB)"
+            )
+
+        label = stages[0][2]
+        self._log(f"{label} weighted contiguous split: " + ", ".join(range_logs))
+        if self.verbose >= 2:
+            self._log(
+                f"{label} primary support weights: "
+                f"{primary_support_bytes / 1024**3:.2f} GiB on {self.devices[0]}; "
+                f"activation reserve={reserve / 1024**3:.2f} GiB/device"
+            )
+        return device_map
+
+    def _llava_decoder_device_map(self, model):
+        """Whole-layer split for the custom LLaVA/Llama text encoder."""
+        language_model = getattr(model, "language_model", None)
+        backbone = getattr(language_model, "model", None) if language_model is not None else None
+        layers = getattr(backbone, "layers", None) if backbone is not None else None
+        if layers is None or len(layers) < len(self.devices):
+            return None
+
+        sizes = [max(1, self._module_nbytes(layer)) for layer in layers]
+        total = sum(sizes)
+        usable = []
+        for no, device in enumerate(self.devices):
+            free, _ = torch.cuda.mem_get_info(device.index)
+            reserve = (2.5 if no == 0 else 1.0) * 1024**3
+            usable.append(max(256 * 1024**2, int(free * self.fraction) - int(reserve)))
+        total_usable = max(1, sum(usable))
+        targets = []
+        running = 0
+        for value in usable[:-1]:
+            running += value
+            targets.append(total * running / total_usable)
+
+        boundaries = []
+        acc = 0
+        target_no = 0
+        for index, size in enumerate(sizes):
+            if target_no >= len(targets):
+                break
+            before, after = acc, acc + size
+            remaining_layers = len(sizes) - index - 1
+            remaining_gpus = len(self.devices) - target_no - 1
+            if remaining_layers == remaining_gpus or after >= targets[target_no]:
+                cut = index + 1
+                if index > (boundaries[-1] if boundaries else 0) and abs(targets[target_no]-before) < abs(after-targets[target_no]):
+                    cut = index
+                cut = max((boundaries[-1] if boundaries else 0) + 1, min(cut, len(sizes)-remaining_gpus))
+                boundaries.append(cut)
+                target_no += 1
+            acc = after
+
+        ranges = []
+        start = 0
+        for end in boundaries + [len(sizes)]:
+            ranges.append((start, end))
+            start = end
+
+        device_map = {}
+        # Vision/projector side stays on primary.
+        for child_name, child in getattr(model, "_modules", {}).items():
+            if child is not None and child_name != "language_model":
+                device_map[child_name] = self.devices[0]
+        # Keep embeddings and lm_head together on primary; norm follows last layer.
+        for child_name, child in getattr(language_model, "_modules", {}).items():
+            if child is not None and child_name != "model":
+                device_map[f"language_model.{child_name}"] = self.devices[0]
+        for child_name, child in getattr(backbone, "_modules", {}).items():
+            if child is None or child_name == "layers":
+                continue
+            device_map[f"language_model.model.{child_name}"] = (
+                self.devices[-1] if child_name == "norm" else self.devices[0]
+            )
+
+        counts = []
+        for device, (start, end) in zip(self.devices, ranges):
+            for index in range(start, end):
+                device_map[f"language_model.model.layers.{index}"] = device
+            counts.append(end - start)
+        self._log(
+            "LLaVA/Llama decoder split: "
+            + ", ".join(f"{device}={count} layers" for device, count in zip(self.devices, counts))
+        )
+        return device_map
     def _ltx2_device_map(self, model):
         """GPU-only weighted contiguous split for LTX2 X0Model.
 
@@ -1406,18 +1657,25 @@ class AccelerateMultiGPU:
         no_split = self._no_split_classes(model)
         device_map = None
         if getattr(model, "model", None) is not None and getattr(getattr(model, "model", None), "layers", None) is not None:
-            # Gemma has tied input/output embeddings. Letting Accelerate infer
-            # them independently can place embed_tokens and lm_head on
-            # different GPUs, duplicating a very large tied tensor and causing
-            # a delayed OOM in the first pre_forward input transfer.
+            # Gemma has tied input/output embeddings.
             device_map = self._gemma_device_map(model)
         elif (
             getattr(model, "velocity_model", None) is not None
             and getattr(getattr(model, "velocity_model", None), "transformer_blocks", None) is not None
         ):
-            # LTX2 X0Model is a sequential block pipeline. Use an explicit
-            # GPU-only split because generic inference may choose disk.
+            # LTX2 X0Model.
             device_map = self._ltx2_device_map(model)
+        elif (
+            getattr(getattr(model, "language_model", None), "model", None) is not None
+            and getattr(getattr(getattr(model, "language_model", None), "model", None), "layers", None) is not None
+        ):
+            # Custom Hunyuan LLaVA encoder: never split inside a Llama decoder layer.
+            device_map = self._llava_decoder_device_map(model)
+        else:
+            # Wan, LTX-Video 0.9.x, Hunyuan and Kandinsky5 expose explicit
+            # sequential block lists. Shard only whole blocks and keep all
+            # root preprocessing/output modules on cuda:0.
+            device_map = self._weighted_top_level_pipeline_map(model)
 
         if device_map is not None:
             self._log(f"{model_id}: using GPU-only weighted contiguous split")
@@ -1500,7 +1758,7 @@ class AccelerateMultiGPU:
                     force_hooks=True,
                 )
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
-            if not self._install_ltx2_jit_loras(model_id, dispatched):
+            if not self._install_block_jit_loras(model_id, dispatched):
                 self._load_loras_for_dispatch(model_id, dispatched)
             dispatched.hf_device_map = device_map
 
