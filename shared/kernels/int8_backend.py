@@ -212,10 +212,16 @@ def linear_multi(modules, x):
         tile = flat[start:stop]
         q, scales = _kitchen.quantize_int8_rowwise_convrot64(tile, 256)
         for module, output in zip(modules, outputs):
+            target = output[start:stop]
             previous = getattr(module, '_wangp_prequantized_input', None)
-            module._wangp_prequantized_input = (q, scales, output[start:stop])
+            module._wangp_prequantized_input = (q, scales, target)
             try:
-                module(tile)
+                result = module(tile)
+                # Plain ConvRot returns the preallocated target. LoRA/DoRA
+                # wrappers are allowed to return a different tensor; preserve
+                # their exact result instead of silently dropping the adapter.
+                if result is not target:
+                    target.copy_(result)
             finally:
                 if previous is None:
                     try:
