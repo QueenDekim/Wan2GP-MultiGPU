@@ -22,8 +22,10 @@ _fusion_logged = False
 _compile_cache_root = None
 _compile_cache_backend = None
 _wide_convrot_triton = None
+_kitchen_dlpack_export = None
+_device_switch_notice = False
 # Bump when changes to INT8 custom operators invalidate compiled graphs.
-_COMPILE_CACHE_VERSION = 1
+_COMPILE_CACHE_VERSION = 2
 # Includes row quantization, a possible INT32 GEMM result, and a temporary output.
 # Never allocate an activation-sized quantization buffer for a whole video.
 _SCRATCH_BYTES = 16 * 1024 * 1024
@@ -45,6 +47,31 @@ def prepare_compile_cache(enabled):
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = path
     _compile_cache_backend = _backend
     print(f"[INT8] Compile Cache: {_backend} (v{_COMPILE_CACHE_VERSION}).")
+
+
+def _export_dlpack(tensor):
+    """Fast inference-only DLPack export.
+
+    Tensor.__dlpack__(stream=-1) validates the process-wide current CUDA
+    device on every call. A quantized Wan step performs thousands of exports,
+    and under Accelerate sharding that validation/context churn dominates
+    runtime on Windows. Kitchen only receives inference tensors here, so use
+    PyTorch's direct exporter like current Wan2GP upstream.
+    """
+    return torch._C._to_dlpack(tensor.detach() if tensor.requires_grad else tensor)
+
+
+def _select_cuda_device(device):
+    """Switch CUDA context only when the active shard actually changes."""
+    global _device_switch_notice
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    if torch.cuda.current_device() != index:
+        torch.cuda.set_device(index)
+        if not _device_switch_notice:
+            print("[INT8] MultiGPU shard-local CUDA context switching enabled.")
+            _device_switch_notice = True
 
 
 def _probe_kitchen():
@@ -172,7 +199,7 @@ def kitchen_linear_prequantized(weight, bias, q, scales, out):
     wrap = _kitchen._wrap_for_dlpack
     used = _kitchen._C.cutlass_int8_dequant(
         wrap(q), wrap(weight._data), wrap(scales), wrap(scale), wrap(bias_arg), wrap(out),
-        _kitchen.DTYPE_TO_CODE[out.dtype], torch.cuda.current_stream(out.device).cuda_stream)
+        _kitchen.DTYPE_TO_CODE[out.dtype], torch._C._cuda_getCurrentRawStream(out.device.index))
     if not used:
         raise RuntimeError("Comfy Kitchen rejected the shared-input INT8 output tile")
     return out
@@ -196,7 +223,7 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
     row_bytes = k + 4 + (x.shape[-1] * x.element_size() if not x.is_contiguous() else 0)
     rows = max(32, (_SCRATCH_BYTES // row_bytes) // 32 * 32)
     wrap = _kitchen._wrap_for_dlpack
-    stream = torch.cuda.current_stream(input.device).cuda_stream
+    stream = torch._C._cuda_getCurrentRawStream(input.device.index)
     bias_arg = (_kitchen._gemm_vector_arg(bias, input.device, input.dtype) if bias is not None
                 else _kitchen._empty_cuda_tensor(input.device, input.dtype))
     act_arg = _kitchen._act_weight_arg(input_act, act_weight, input.device, input.dtype)
@@ -263,7 +290,7 @@ def _cutlass_linear_chunked(x, weight, scale, bias, convrot):
     wrap = _kitchen._wrap_for_dlpack
     bias_arg = (_kitchen._gemm_vector_arg(bias, x.device, x.dtype) if bias is not None
                 else _kitchen._empty_cuda_tensor(x.device, x.dtype))
-    stream = torch.cuda.current_stream(x.device).cuda_stream
+    stream = torch._C._cuda_getCurrentRawStream(x.device.index)
     for start in range(0, m, rows):
         stop = min(start + rows, m)
         if convrot:
@@ -297,31 +324,28 @@ def _register_ops():
 
 
 def kitchen_linear(input, weight, bias=None, *, convrot=False):
-    # Comfy Kitchen exports CUDA tensors through DLPack and validates against
-    # torch.cuda.current_device(). With Accelerate model sharding the active
-    # layer may live on cuda:1+ while the process-wide current device remains
-    # cuda:0. Always execute the whole kernel path in the input tensor's CUDA
-    # context so DLPack, streams and temporary allocations use the same GPU.
+    # Accelerate shards the model across CUDA devices. Keep the process CUDA
+    # context on the shard that is currently executing instead of entering and
+    # leaving torch.cuda.device() for every single linear layer.
     device = input.device
     if device.type != "cuda":
         raise RuntimeError(f"Comfy Kitchen INT8 expected a CUDA input, got {device}")
+    _select_cuda_device(device)
 
-    with torch.cuda.device(device):
-        if convrot and _direct_cutlass and input.shape[-1] > 16384:
-            if (_wide_convrot_triton is not None and not torch.compiler.is_compiling()
-                    and not triton._is_fake_tensor(input)):
-                return _wide_convrot_linear(input, weight, bias)
-            # The wide cuBLAS path cannot be captured on validated SM120. Keep a
-            # graph-safe Quanto fallback when Triton is unavailable.
-            from shared.qtypes.int8_convrot import _rotate_activation
-            return torch.nn.functional.linear(_rotate_activation(input, 256), weight, bias)
-        scale = triton._prepare_weight_scale(weight._scale, weight.shape[0], device)
-        x = input.reshape(-1, input.shape[-1])
-        if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
-            out = torch.ops.wan2gp_kitchen.linear(x, weight._data, scale, bias, convrot)
-        else:
-            out = _linear_impl(x, weight._data, scale, bias, convrot)
-        return out.reshape(*input.shape[:-1], weight.shape[0])
+    if convrot and _direct_cutlass and input.shape[-1] > 16384:
+        if (_wide_convrot_triton is not None and not torch.compiler.is_compiling()
+                and not triton._is_fake_tensor(input)):
+            return _wide_convrot_linear(input, weight, bias)
+        from shared.qtypes.int8_convrot import _rotate_activation
+        return torch.nn.functional.linear(_rotate_activation(input, 256), weight, bias)
+
+    scale = triton._prepare_weight_scale(weight._scale, weight.shape[0], device)
+    x = input.reshape(-1, input.shape[-1])
+    if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
+        out = torch.ops.wan2gp_kitchen.linear(x, weight._data, scale, bias, convrot)
+    else:
+        out = _linear_impl(x, weight._data, scale, bias, convrot)
+    return out.reshape(*input.shape[:-1], weight.shape[0])
 
 
 def _quanto_forward(ctx, input, weight, bias=None):
@@ -338,8 +362,12 @@ def _quanto_forward(ctx, input, weight, bias=None):
 
 def configure(selection, verbose_level=0, *, resolved=None):
     global _backend, _kitchen, _kitchen_hip, _original_forward, _direct_cutlass, _wide_convrot_triton, revision
+    global _kitchen_dlpack_export
     backend, module = resolve_backend(selection) if resolved is None else resolved
     previous_backend = _backend
+    if _kitchen_dlpack_export is not None:
+        _kitchen_dlpack_export[0]._wrap_for_dlpack = _kitchen_dlpack_export[1]
+        _kitchen_dlpack_export = None
     if _original_forward is not None:
         from optimum.quanto.tensor.weights import qbytes
         qbytes.WeightQBytesLinearFunction.forward = staticmethod(_original_forward)
@@ -358,6 +386,9 @@ def configure(selection, verbose_level=0, *, resolved=None):
         _register_ops()
         _kitchen = module
         _kitchen_hip = torch.version.hip is not None
+        if not _kitchen_hip:
+            _kitchen_dlpack_export = (module, module._wrap_for_dlpack)
+            module._wrap_for_dlpack = _export_dlpack
         _direct_cutlass = not _kitchen_hip and torch.cuda.get_device_capability() == (12, 0) and not module._DISABLE_CUTLASS_INT8
         if _direct_cutlass:
             _wide_convrot_triton, _ = triton._probe_triton_backend()
