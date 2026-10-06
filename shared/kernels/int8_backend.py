@@ -24,6 +24,7 @@ _compile_cache_backend = None
 _wide_convrot_triton = None
 _kitchen_dlpack_export = None
 _device_switch_notice = False
+_linear_multi_notice = False
 # Bump when changes to INT8 custom operators invalidate compiled graphs.
 _COMPILE_CACHE_VERSION = 2
 # Includes row quantization, a possible INT32 GEMM result, and a temporary output.
@@ -170,13 +171,45 @@ def linear_with_fusion(module, x, *, input_act=None, act_weight=None, act_eps=0.
             module._wangp_linear_fusion = previous
 
 
+def can_linear_multi(modules, x):
+    """True when several ConvRot linears can share one quantized activation."""
+    if (not kitchen_enabled() or not _direct_cutlass or type(x) is not torch.Tensor
+            or not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or x.shape[-1] > 16384):
+        return False
+    for module in modules:
+        if (getattr(module, '_convrot_group_size', 0) != 256
+                or getattr(module, 'in_features', None) != x.shape[-1]
+                or getattr(module, 'out_features', 0) % 8 != 0):
+            return False
+        weight = getattr(module, 'qweight', None)
+        data = getattr(weight, '_data', None)
+        if (data is None or not data.is_cuda or data.device != x.device
+                or data.dtype != torch.int8 or not data.is_contiguous()
+                or data.shape[-1] % 256 != 0):
+            return False
+        if not _kitchen._convrot_fused_shared_memory_fits(x, module.in_features, 256):
+            return False
+    return True
+
+
 def linear_multi(modules, x):
-    """Reuse one bounded ConvRot input tile across projections, retaining MMGP hooks."""
-    outputs = [x.new_empty((x.shape[0], module.out_features)) for module in modules]
-    rows = max(32, (_SCRATCH_BYTES // (x.shape[-1] + 4)) // 32 * 32)
-    for start in range(0, x.shape[0], rows):
-        stop = min(start + rows, x.shape[0])
-        tile = x[start:stop]
+    """Reuse one bounded ConvRot input tile across projections, retaining LoRA wrappers."""
+    global _linear_multi_notice
+    if not can_linear_multi(modules, x):
+        return [module(x) for module in modules]
+    _select_cuda_device(x.device)
+    if not _linear_multi_notice:
+        print("[INT8] Shared Q/K/V activation quantization enabled.")
+        _linear_multi_notice = True
+
+    shape = x.shape[:-1]
+    flat = x.reshape(-1, x.shape[-1])
+    outputs = [flat.new_empty((flat.shape[0], module.out_features)) for module in modules]
+    rows = max(32, (_SCRATCH_BYTES // (flat.shape[-1] + 4)) // 32 * 32)
+    for start in range(0, flat.shape[0], rows):
+        stop = min(start + rows, flat.shape[0])
+        tile = flat[start:stop]
         q, scales = _kitchen.quantize_int8_rowwise_convrot64(tile, 256)
         for module, output in zip(modules, outputs):
             previous = getattr(module, '_wangp_prequantized_input', None)
@@ -185,11 +218,14 @@ def linear_multi(modules, x):
                 module(tile)
             finally:
                 if previous is None:
-                    del module._wangp_prequantized_input
+                    try:
+                        del module._wangp_prequantized_input
+                    except AttributeError:
+                        pass
                 else:
                     module._wangp_prequantized_input = previous
         del q, scales
-    return outputs
+    return [output.view(*shape, output.shape[-1]) for output in outputs]
 
 
 def kitchen_linear_prequantized(weight, bias, q, scales, out):
