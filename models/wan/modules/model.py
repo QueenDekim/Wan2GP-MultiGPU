@@ -14,6 +14,7 @@ from typing import Union,Optional
 from mmgp import offload
 from mmgp.offload import get_cache, clear_caches
 from shared.attention import pay_attention
+from shared.kernels import int8_backend
 from torch.backends.cuda import sdp_kernel
 from ..multitalk.multitalk_utils import get_attn_map_with_target
 from ..animate.motion_encoder import Generator
@@ -317,6 +318,30 @@ class WanSelfAttention(nn.Module):
         xlist.clear()
 
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # Fast path for the normal Wan denoising attention. q/k/v see exactly
+        # the same activation, so ConvRot INT8 can quantize it once instead of
+        # three times. Keep all special attention modes on their original path.
+        simple_attention = (
+            block_mask is None
+            and ref_target_masks is None
+            and standin_phase < 1
+            and lynx_ref_buffer is None
+            and not offload.shared_state.get("_chipmunk", False)
+            and not offload.shared_state.get("_radial", False)
+        )
+        if simple_attention and int8_backend.can_linear_multi((self.q, self.k, self.v), x):
+            q, k, v = int8_backend.linear_multi((self.q, self.k, self.v), x)
+            self.norm_q(q)
+            self.norm_k(k)
+            q, k, v = q.view(b, s, n, d), k.view(b, s, n, d), v.view(b, s, n, d)
+            qklist = [q, k]
+            del q, k, x
+            q, k = apply_rotary_emb(qklist, freqs, head_first=False)
+            qkv_list = [q, k, v]
+            del q, k, v
+            out = pay_attention(qkv_list, recycle_q=True)
+            return self.o(out.flatten(2)), None
 
         # query, key, value function
         q = self.q(x)
