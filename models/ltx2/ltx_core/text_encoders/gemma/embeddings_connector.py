@@ -141,6 +141,14 @@ class Embeddings1DConnector(torch.nn.Module):
     def _replace_padded_with_learnable_registers(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # In MultiGPU mode the Gemma decoder may finish on a secondary shard
+        # while the connector itself is resident on cuda:0. The attention mask
+        # is metadata and can therefore retain the decoder shard device. PyTorch
+        # advanced indexing requires the boolean index to live on the indexed
+        # tensor's device, so normalize it at the connector boundary.
+        if attention_mask.device != hidden_states.device:
+            attention_mask = attention_mask.to(hidden_states.device, non_blocking=True)
+
         assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
             f"Hidden states sequence length {hidden_states.shape[1]} must be divisible by num_learnable_registers "
             f"{self.num_learnable_registers}."
@@ -179,6 +187,9 @@ class Embeddings1DConnector(torch.nn.Module):
         Returns:
             tuple[torch.Tensor, torch.Tensor]: Processed features and the corresponding (possibly modified) mask.
         """
+        if attention_mask is not None and attention_mask.device != hidden_states.device:
+            attention_mask = attention_mask.to(hidden_states.device, non_blocking=True)
+
         block_attention_mask = attention_mask
         if self.num_learnable_registers:
             hidden_states, attention_mask = self._replace_padded_with_learnable_registers(hidden_states, attention_mask)
