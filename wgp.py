@@ -2658,6 +2658,19 @@ def _resolve_multigpu_runtime(args):
     return devices
 
 multigpu_devices_runtime = _resolve_multigpu_runtime(args)
+
+# MultiGPU is VRAM-first: checkpoint backing must stay file-backed and
+# reclaimable instead of creating Windows ACCESS_COPY private mappings.
+# MMGP safetensors2 otherwise uses writable_tensors=True -> mmap.ACCESS_COPY,
+# which can inflate Private Bytes by roughly the size of the checkpoint.
+safetensors2.all_tensors_are_read_only = bool(args.multigpu)
+if args.multigpu:
+    print(
+        "[MultiGPU] Host backing: read-only file mmap enabled "
+        "(no private COW checkpoint mapping)",
+        flush=True,
+    )
+
 migrate_loras_layout()
 
 gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
