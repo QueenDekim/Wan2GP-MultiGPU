@@ -199,6 +199,12 @@ def _apply_connectors(
     embeddings_connector: Embeddings1DConnector,
     audio_embeddings_connector: Embeddings1DConnector,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Gemma can be sharded across GPUs, while the feature projection/connectors
+    # run on the primary device. Keep the token mask with the projected features
+    # before constructing the additive attention mask.
+    if attention_mask.device != encoded_video_input.device:
+        attention_mask = attention_mask.to(encoded_video_input.device, non_blocking=True)
+
     connector_attention_mask = (attention_mask - 1).to(encoded_video_input.dtype).reshape(
         (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
     ) * torch.finfo(encoded_video_input.dtype).max
@@ -209,9 +215,15 @@ def _apply_connectors(
     attention_mask_out = (encoded_connector_attention_mask < 0.000001).to(torch.int64)
     attention_mask_out = attention_mask_out.reshape([encoded.shape[0], encoded.shape[1], 1])
     encoded = encoded * attention_mask_out
+    audio_input = encoded_video_input if encoded_audio_input is None else encoded_audio_input
+    audio_attention_mask = (
+        connector_attention_mask
+        if connector_attention_mask.device == audio_input.device
+        else connector_attention_mask.to(audio_input.device, non_blocking=True)
+    )
     encoded_for_audio, encoded_audio_connector_attention_mask = audio_embeddings_connector(
-        encoded_video_input if encoded_audio_input is None else encoded_audio_input,
-        connector_attention_mask,
+        audio_input,
+        audio_attention_mask,
     )
     audio_attention_mask_out = (encoded_audio_connector_attention_mask < 0.000001).to(torch.int64)
     audio_attention_mask_out = audio_attention_mask_out.reshape([encoded_for_audio.shape[0], encoded_for_audio.shape[1], 1])
