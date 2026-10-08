@@ -27,7 +27,6 @@ class AccelerateMultiGPU:
         # be empty so MMGP cannot silently pull a 1-2 GiB block back to GPU0.
         self._suspended_mmgp_blocks: dict[str, object] = {}
         self._suspended_mmgp_forwards: dict[str, list[tuple[torch.nn.Module, object]]] = {}
-        self._original_tensor_backing: dict[str, list[tuple[torch.nn.Module, str, object, bool]]] = {}
         self._jit_lora_hooks: dict[str, list[object]] = {}
         self.installed = False
 
@@ -381,7 +380,7 @@ class AccelerateMultiGPU:
                 del adapters[key]
 
     def _install_block_jit_loras(self, model_id, model):
-        """Use one-block-at-a-time LoRA residency for any known block pipeline."""
+        """Hybrid LoRA residency: fill spare VRAM, JIT only the remainder."""
         active = list(getattr(model, "_loras_active_adapters", None) or [])
         loras_model_data = getattr(model, "_loras_model_data", None)
         stages = self._block_pipeline_stages(model)
@@ -433,7 +432,20 @@ class AccelerateMultiGPU:
         ]
         outside_modules, outside_bytes = self._move_loras_for_modules(model, outside)
 
-        handles = []
+        # Use otherwise-idle VRAM as a LoRA cache. Keep the activation reserve
+        # untouched and leave an extra 256 MiB allocator guard per GPU.
+        persistent_budget = {}
+        for device in self.devices:
+            free, _ = torch.cuda.mem_get_info(device.index)
+            persistent_budget[str(device)] = max(
+                0,
+                int(free) - reserve - 256 * 1024**2,
+            )
+
+        persistent_by_device = {}
+        jit_groups = []
+        persistent_group_count = 0
+        persistent_estimated_bytes = 0
         max_block_bytes = 0
         grouped_modules = 0
 
@@ -441,10 +453,41 @@ class AccelerateMultiGPU:
             if not group:
                 continue
             grouped_modules += len(group)
-            group_bytes = sum(self._lora_bytes_by_device(model, group).values())
+            device = None
+            for lora_module in group:
+                device = self._module_device(lora_module)
+                if device is not None and device.type == "cuda":
+                    break
+            if device is None or device.type != "cuda":
+                jit_groups.append((block, group))
+                continue
+
+            group_by_device = self._lora_bytes_by_device(model, group)
+            group_bytes = int(group_by_device.get(str(device), 0))
             max_block_bytes = max(max_block_bytes, group_bytes)
 
-            # Capture each group by value: hooks are installed in a loop.
+            budget = persistent_budget.get(str(device), 0)
+            if group_bytes and group_bytes <= budget:
+                persistent_by_device.setdefault(str(device), (device, []))[1].extend(group)
+                persistent_budget[str(device)] = budget - group_bytes
+                persistent_group_count += 1
+                persistent_estimated_bytes += group_bytes
+            else:
+                jit_groups.append((block, group))
+
+        persistent_moved_bytes = 0
+        persistent_modules = 0
+        for _, (device, modules) in persistent_by_device.items():
+            moved_modules, moved_bytes = self._move_loras_for_modules(
+                model,
+                modules,
+                forced_device=device,
+            )
+            persistent_modules += moved_modules
+            persistent_moved_bytes += moved_bytes
+
+        handles = []
+        for block, group in jit_groups:
             def pre_hook(_module, _inputs, group=tuple(group)):
                 device = None
                 for lora_module in group:
@@ -464,22 +507,27 @@ class AccelerateMultiGPU:
             except TypeError:
                 handles.append(block.register_forward_hook(post_hook))
 
-        if not handles:
-            self._drop_loras_for_modules(model, outside)
-            return False
+        if handles:
+            self._jit_lora_hooks.setdefault(model_id, []).extend(handles)
 
-        self._jit_lora_hooks[model_id] = handles
-        self._log(
-            f"{model_id}: LoRA block-JIT residency enabled for {grouped_modules} module(s) "
-            f"across {len(blocks)} block(s); full residency would violate "
-            f"{reserve / 1024**3:.2f} GiB activation reserve"
-        )
-        self._log(
-            f"{model_id}: JIT LoRA peak block ~{max_block_bytes / 1024**2:.1f} MiB; "
-            f"outside-block residency {outside_bytes / 1024**2:.1f} MiB "
-            f"({outside_modules} module(s)); " + ", ".join(diagnostics)
-        )
-        return True
+        # Even if every block fitted persistently, return True: the LoRA
+        # residency was already prepared here and full-loader must not run.
+        if persistent_group_count or handles or outside_modules:
+            self._log(
+                f"{model_id}: hybrid LoRA residency: "
+                f"{persistent_group_count} block(s) persistent, "
+                f"{len(jit_groups)} block(s) JIT; "
+                f"persistent ~{persistent_moved_bytes / 1024**2:.1f} MiB, "
+                f"JIT peak ~{max_block_bytes / 1024**2:.1f} MiB"
+            )
+            self._log(
+                f"{model_id}: outside-block residency {outside_bytes / 1024**2:.1f} MiB "
+                f"({outside_modules} module(s)); activation reserve "
+                f"{reserve / 1024**3:.2f} GiB; " + ", ".join(diagnostics)
+            )
+            return True
+
+        return False
 
     def _load_loras_for_dispatch(self, model_id, model):
         """Place active LoRA tensors beside each sharded base layer."""
@@ -637,6 +685,42 @@ class AccelerateMultiGPU:
             else:
                 self._log(f"Host working set trimmed{suffix}")
 
+    def _trim_host_working_set_if_pressure(self, reason="runtime pressure"):
+        """Trim reclaimable mmap pages only when host RAM is actually tight."""
+        if os.name != "nt":
+            return False
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            process = psutil.Process(os.getpid())
+            rss = int(process.memory_info().rss)
+            threshold = max(3 * 1024**3, int(vm.total * 0.20))
+            pressured = int(vm.available) < threshold or rss > max(4 * 1024**3, int(vm.total * 0.30))
+        except Exception:
+            return False
+        if not pressured:
+            return False
+        self._trim_host_working_set(reason)
+        return True
+
+    def _install_pass_end_host_trim(self, model_id, model):
+        """Evict cold file-backed pages once per transformer pass under pressure."""
+        stages = self._block_pipeline_stages(model)
+        blocks = [block for _, stage_blocks, _ in stages for block in stage_blocks]
+        if not blocks:
+            return
+        last_block = blocks[-1]
+
+        def post_hook(_module, _inputs, output):
+            self._trim_host_working_set_if_pressure(f"{model_id} denoise pass")
+            return output
+
+        try:
+            handle = last_block.register_forward_hook(post_hook, always_call=True)
+        except TypeError:
+            handle = last_block.register_forward_hook(post_hook)
+        self._jit_lora_hooks.setdefault(model_id, []).append(handle)
+
     def _ensure_state_dict_compat(self, model_id, model):
         """Repair every MMGP Quanto state_dict monkey-patch in the module graph.
 
@@ -695,40 +779,6 @@ class AccelerateMultiGPU:
                 f"{model_id}: repaired MMGP state_dict signature on "
                 f"{repaired} module(s)"
             )
-
-    def _capture_original_tensor_backing(self, model_id, model):
-        """Keep references to existing CPU/MMAP tensors before CUDA dispatch."""
-        if model_id in self._original_tensor_backing:
-            return
-        entries = []
-        for module in self._iter_modules_unique(model):
-            for name, value in getattr(module, "_parameters", {}).items():
-                if value is not None:
-                    entries.append((module, name, value, False))
-            for name, value in getattr(module, "_buffers", {}).items():
-                if value is not None:
-                    entries.append((module, name, value, True))
-        self._original_tensor_backing[model_id] = entries
-        if self.verbose >= 2:
-            self._log(f"{model_id}: captured {len(entries)} original CPU/MMAP tensor reference(s)")
-
-    def _restore_original_tensor_backing(self, model_id):
-        entries = self._original_tensor_backing.pop(model_id, None)
-        if not entries:
-            return 0
-        restored = 0
-        for module, name, value, is_buffer in entries:
-            try:
-                registry = module._buffers if is_buffer else module._parameters
-                registry[name] = value
-                restored += 1
-            except Exception:
-                try:
-                    setattr(module, name, value)
-                    restored += 1
-                except Exception:
-                    pass
-        return restored
 
     def _remove_accelerate_hooks(self, model):
         """Remove Accelerate hooks without recursive child traversal."""
@@ -790,11 +840,6 @@ class AccelerateMultiGPU:
                 break
 
         self._unload_dispatched_loras(model)
-
-        if model_id is not None:
-            restored_backing = self._restore_original_tensor_backing(model_id)
-            if restored_backing and self.verbose >= 2:
-                self._log(f"{model_id}: restored {restored_backing} original CPU/MMAP tensor reference(s)")
 
         original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
         if model_id is not None:
@@ -1643,7 +1688,6 @@ class AccelerateMultiGPU:
         self._detach_registered_lora_owner_cycles(model_id, model)
         self._detach_registered_module_cycles(model_id, model)
         self._ensure_state_dict_compat(model_id, model)
-        self._capture_original_tensor_backing(model_id, model)
         self._remove_accelerate_hooks(model)
         self._suspend_mmgp_forwards(model_id, model)
 
@@ -1796,6 +1840,7 @@ class AccelerateMultiGPU:
             self._sanitize_accelerate_old_forwards(model_id, dispatched)
             if not self._install_block_jit_loras(model_id, dispatched):
                 self._load_loras_for_dispatch(model_id, dispatched)
+            self._install_pass_end_host_trim(model_id, dispatched)
             dispatched.hf_device_map = device_map
 
             # At this point the active stage is fully GPU-resident. The CPU
@@ -1810,7 +1855,6 @@ class AccelerateMultiGPU:
             try:
                 self._move_model_to_cpu(model)
             except Exception:
-                self._restore_original_tensor_backing(model_id)
                 self._remove_accelerate_hooks(model)
                 self._restore_mmgp_blocks(model_id)
                 self._restore_mmgp_forwards(model_id)
