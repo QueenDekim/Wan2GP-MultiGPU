@@ -637,7 +637,7 @@ class AccelerateMultiGPU:
             return
 
         gc.collect()
-        before = after = None
+        before = after = private_after = None
         try:
             import psutil
             process = psutil.Process(os.getpid())
@@ -671,16 +671,23 @@ class AccelerateMultiGPU:
 
         if process is not None:
             try:
-                after = process.memory_info().rss
+                mem_info = process.memory_info()
+                after = mem_info.rss
+                private_after = getattr(mem_info, "private", None)
             except Exception:
                 pass
 
         if self.verbose >= 1:
             suffix = f" after {reason}" if reason else ""
             if before is not None and after is not None:
+                private_suffix = (
+                    f", private={private_after / 1024**3:.2f} GiB"
+                    if private_after is not None else ""
+                )
                 self._log(
                     f"Host working set trimmed{suffix}: "
                     f"{before / 1024**3:.2f} -> {after / 1024**3:.2f} GiB"
+                    f"{private_suffix}"
                 )
             else:
                 self._log(f"Host working set trimmed{suffix}")
