@@ -62,7 +62,7 @@
 
 - [🚀 Quick Start](#-quick-start)
 - [📦 Installation](#-installation)
-- [🖥️ Tiered MultiGPU Offload](#️-tiered-multigpu-offload)
+- [🖥️ Tiered MultiGPU Offload](#multigpu)
 - [🎯 Usage](#-usage)
 - [📚 Documentation](#-documentation)
 - [🔗 Related Projects](#-related-projects)
@@ -258,6 +258,7 @@ For detailed installation instructions for different GPU generations:
 For detailed installation instructions for different GPU generations:
 - **[Installation Guide](docs/AMD-INSTALLATION.md)** - Complete setup instructions for RDNA 4, 3, 3.5, and 2
 
+<a id="multigpu"></a>
 ## 🖥️ Tiered MultiGPU Offload
 
 **MultiGPU by [QueenDekim](https://github.com/QueenDekim)** extends the original **Wan2GP v13.141 by [DeepBeepMeep](https://github.com/deepbeepmeep)** with a GPU-first, multi-device execution path. For supported architectures, model blocks are **dispatched to multiple NVIDIA GPUs** with Hugging Face Accelerate. Unlike a simple secondary-GPU LRU cache, those blocks perform their forward computations on their assigned GPUs.
