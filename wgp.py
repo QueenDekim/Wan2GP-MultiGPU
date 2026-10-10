@@ -14249,8 +14249,16 @@ def create_ui():
     else:
         stats_app = None
 
-    with ui_studio.Blocks(css=css, js=js, theme=theme, title="WanGP", fill_width=True) as main:
-        gr.Markdown(f'<div align=center><H1>Wan<SUP style="color: #2563eb;">GP</SUP> v{WanGP_version} <FONT SIZE=4>by <I>DeepBeepMeep</I></FONT> <FONT SIZE=3>') # (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>Updates</A>)</FONT SIZE=3></H1></div>")
+    with ui_studio.Blocks(css=css, js=js, theme=theme, title=f"WanGP v{WanGP_version} - MultiGPU by QueenDekim", fill_width=True) as main:
+        gr.Markdown(
+            f'<div align="center">'
+            f'<h1>Wan<sup style="color: #2563eb;">GP</sup> v{WanGP_version}</h1>'
+            f'<div>Wan2GP v{WanGP_version} by '
+            f'<a href="https://github.com/deepbeepmeep" target="_blank" rel="noopener noreferrer">DeepBeepMeep</a>'
+            f'<br>MultiGPU by '
+            f'<a href="https://github.com/QueenDekim" target="_blank" rel="noopener noreferrer">QueenDekim</a>'
+            f'</div></div>'
+        )")
         global model_list
 
         tab_state = gr.State({ "tab_no":0 }) 
