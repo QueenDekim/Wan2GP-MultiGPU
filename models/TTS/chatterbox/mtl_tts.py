@@ -213,9 +213,14 @@ class ChatterboxMultilingualTTS:
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
 
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        # Keep speaker embeddings on the GPU for the entire conditioning
+        # pipeline. Avoid the previous CUDA -> NumPy/CPU -> CUDA roundtrip.
+        ve_embed = self.ve.embeds_from_wavs(
+            [ref_16k_wav],
+            sample_rate=S3_SR,
+            return_tensor=True,
+            output_device=self.device,
+        ).mean(dim=0, keepdim=True)
 
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
@@ -290,6 +295,7 @@ class ChatterboxMultilingualTTS:
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
             )
-            watermarked_wav = wav.squeeze(0).detach().cpu().numpy()
-            # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            # Audio remains a CUDA tensor until the outer WanGP media writer
+            # explicitly transfers it for file encoding.
+            output_wav = wav.squeeze(0).detach().unsqueeze(0)
+        return output_wav
