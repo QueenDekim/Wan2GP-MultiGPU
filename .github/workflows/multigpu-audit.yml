@@ -34,7 +34,8 @@ jobs:
             models/TTS/chatterbox/models/t3/modules/cond_enc.py \
             models/TTS/chatterbox/models/voice_encoder/voice_encoder.py \
             models/TTS/chatterbox/mtl_tts.py \
-            models/TTS/chatterbox/pipeline.py
+            models/TTS/chatterbox/pipeline.py \
+            scripts/multigpu_smoke.py
       - name: Inventory all model families and memory transitions
         run: |
           python scripts/audit_multigpu.py --out multigpu-audit.json
