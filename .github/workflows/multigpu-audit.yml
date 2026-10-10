@@ -9,6 +9,7 @@ on:
       - 'preprocessing/**'
       - 'postprocessing/**'
       - 'scripts/audit_multigpu.py'
+      - 'scripts/multigpu_smoke.py'
       - 'wgp.py'
       - '.github/workflows/multigpu-audit.yml'
   pull_request:
