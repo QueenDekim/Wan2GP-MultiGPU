@@ -188,7 +188,15 @@ class VoiceEncoder(nn.Module):
 
         # Forward the partials
         n_chunks = int(np.ceil(len(partials) / (batch_size or len(partials))))
-        partial_embeds = torch.cat([self(batch) for batch in partials.chunk(n_chunks)], dim=0).cpu()
+        # MMGP/Accelerate can return chunk embeddings on different devices as
+        # hooks move the voice encoder between CPU and CUDA. This API already
+        # promises CPU embeddings; normalize each small result before cat.
+        # Avoid accumulating all chunk outputs in VRAM or transferring the
+        # entire concatenated result at once.
+        partial_embeds = torch.cat(
+            [self(batch).to(device="cpu") for batch in partials.chunk(n_chunks)],
+            dim=0,
+        )
 
         # Reduce the partial embeds into full embeds and L2-normalize them
         slices = np.concatenate(([0], np.cumsum(n_partials)))
