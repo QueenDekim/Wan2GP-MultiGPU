@@ -11,6 +11,8 @@ on:
       - 'scripts/audit_multigpu.py'
       - 'scripts/multigpu_smoke.py'
       - 'wgp.py'
+      - 'README.md'
+      - 'plugins/about/plugin.py'
       - '.github/workflows/multigpu-audit.yml'
   pull_request:
   workflow_dispatch:
@@ -36,7 +38,28 @@ jobs:
             models/TTS/chatterbox/models/voice_encoder/voice_encoder.py \
             models/TTS/chatterbox/mtl_tts.py \
             models/TTS/chatterbox/pipeline.py \
+            plugins/about/plugin.py \
             scripts/multigpu_smoke.py
+      - name: Verify README and UI project attribution
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          header = Path("wgp.py").read_text(encoding="utf-8")
+          about = Path("plugins/about/plugin.py").read_text(encoding="utf-8")
+
+          assert "🔥 Latest Updates" not in readme
+          assert "Wan2GP v13.141 by" in readme
+          assert "MultiGPU by" in readme
+          assert "github.com/QueenDekim" in readme
+          assert "github.com/deepbeepmeep" in readme
+          assert "MultiGPU by QueenDekim" in header
+          assert "github.com/QueenDekim" in header
+          assert "github.com/deepbeepmeep" in header
+          assert "GPU-first fork" in about
+          assert "QueenDekim" in about
+          PY
       - name: Inventory all model families and memory transitions
         run: |
           python scripts/audit_multigpu.py --out multigpu-audit.json
