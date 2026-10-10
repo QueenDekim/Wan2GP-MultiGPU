@@ -125,12 +125,12 @@ def inspect_file(path: Path, root: Path) -> dict:
 
 
 def audit(root: Path) -> dict:
-    roots = [root / name for name in HEAVY_RUNTIME_DIRS if (root / name).exists()]
+    roots = [root]  # Scan the entire tracked working tree, not only model folders.
     results = [
         inspect_file(path, root)
         for folder in roots
         for path in sorted(folder.rglob("*.py"))
-        if not any(part in ("__pycache__", ".venv", "venv") for part in path.parts)
+        if not any(part in ("__pycache__", ".venv", "venv", ".git", ".tox", "site-packages") for part in path.parts)
     ]
     totals = Counter()
     families = defaultdict(Counter)
@@ -182,6 +182,8 @@ def main() -> None:
         f"{len(report['parse_errors'])} parse errors"
     )
     print("Risks:", json.dumps(report["risks"], sort_keys=True))
+    for finding in report["findings"]:
+        print("[MultiGPU audit] Review:", json.dumps(finding, ensure_ascii=False))
     if report["parse_errors"]:
         print("Parse errors:", json.dumps(report["parse_errors"][:10]))
 
