@@ -1119,51 +1119,86 @@ class AccelerateMultiGPU:
 
 
     def _gemma_device_map(self, model):
-        """GPU-only contiguous Gemma split using every configured CUDA device.
+        """Map whole decoder layers by actual weight bytes, not layer counts.
 
-        Keep tied embed_tokens/lm_head together on the primary device and
-        distribute decoder layers proportionally to currently available VRAM.
-        A single contiguous range per GPU minimizes inter-device activation
-        transfers while leaving extra headroom on GPU#0 for embeddings, logits
-        and pipeline activations.
+        In particular, Gemma has a large, possibly tied embedding/lm_head on
+        the primary GPU. A 24/24 split based on free VRAM alone is unsafe
+        because embeddings and existing allocations consume part of GPU0.
+        A physical zero-capacity GPU must never be assigned an invented 256 MiB.
         """
         backbone = getattr(model, "model", None)
         layers = getattr(backbone, "layers", None)
         if layers is None or len(layers) < len(self.devices) or len(self.devices) < 2:
             return None
 
-        total_layers = len(layers)
-        usable = []
-        for no, device in enumerate(self.devices):
+        layer_sizes = [max(1, self._module_nbytes(layer)) for layer in layers]
+        total_layers = len(layer_sizes)
+        total_layer_bytes = sum(layer_sizes)
+        # _module_nbytes deduplicates tied tensors (e.g. lm_head/embed_tokens).
+        # Count every other root and decoder-support tensor on GPU0. Norm is
+        # tiny; reserving it on GPU0 too is deliberately conservative.
+        support_bytes = max(0, self._module_nbytes(model) - total_layer_bytes)
+        capacities = []
+        free_bytes = []
+        for device_no, device in enumerate(self.devices):
             free, _ = torch.cuda.mem_get_info(device.index)
-            reserve = (2.5 if no == 0 else 0.75) * 1024**3
-            usable_bytes = max(256 * 1024**2, int(free * self.fraction) - int(reserve))
-            usable.append(usable_bytes)
+            free = int(free)
+            free_bytes.append(free)
+            # Leave room for prompt embeddings/attention and CUDA temporaries.
+            guard = (1024 if device_no == 0 else 512) * 1024**2
+            reserve = support_bytes if device_no == 0 else 0
+            capacities.append(max(0, int(free * self.fraction) - guard - reserve))
 
-        total_usable = max(1, sum(usable))
-        raw = [total_layers * value / total_usable for value in usable]
-        counts = [int(value) for value in raw]
-        remaining = total_layers - sum(counts)
-        order = sorted(
-            range(len(raw)),
-            key=lambda i: (raw[i] - counts[i], usable[i]),
-            reverse=True,
-        )
-        for i in order[:remaining]:
-            counts[i] += 1
+        def insufficient(reason):
+            breakdown = ", ".join(
+                f"{device}: free={free / 1024**3:.2f} GiB, "
+                f"usable_for_layers={capacity / 1024**3:.2f} GiB"
+                for device, free, capacity in zip(self.devices, free_bytes, capacities)
+            )
+            raise RuntimeError(
+                f"MultiGPU GPU-only Gemma placement impossible: {reason}. "
+                f"Decoder weights={total_layer_bytes / 1024**3:.2f} GiB, "
+                f"embedding/support weights={support_bytes / 1024**3:.2f} GiB; "
+                f"{breakdown}. Free VRAM by unloading other models or restarting "
+                "the app, or choose a smaller/quantized Gemma checkpoint. "
+                "RAM/disk offload is intentionally disabled."
+            )
 
-        # Use every configured GPU whenever there are enough decoder layers.
-        if total_layers >= len(self.devices):
-            empty = [i for i, count in enumerate(counts) if count == 0]
-            for empty_i in empty:
-                donor = max(range(len(counts)), key=lambda i: counts[i])
-                if counts[donor] > 1:
-                    counts[donor] -= 1
-                    counts[empty_i] += 1
+        if sum(capacities) < total_layer_bytes:
+            insufficient("decoder weights exceed available VRAM after embeddings and guards")
+        if any(capacity < min(layer_sizes) for capacity in capacities):
+            insufficient("at least one GPU cannot hold even one decoder layer")
+
+        # Prefix sums let us find a contiguous, whole-layer split that fits
+        # *each* physical GPU. Minimise deviation from capacity-weighted load.
+        prefix = [0]
+        for amount in layer_sizes:
+            prefix.append(prefix[-1] + amount)
+        capacity_sum = max(1, sum(capacities))
+        target = [total_layer_bytes * cap / capacity_sum for cap in capacities]
+        states = {0: (0.0, ())}
+        for device_no, capacity in enumerate(capacities):
+            next_states = {}
+            remaining_devices = len(self.devices) - device_no - 1
+            for begin, (score, ranges) in states.items():
+                for stop in range(begin + 1, total_layers - remaining_devices + 1):
+                    needed = prefix[stop] - prefix[begin]
+                    if needed > capacity:
+                        break
+                    if remaining_devices == 0 and stop != total_layers:
+                        continue
+                    deviation = (needed - target[device_no]) / max(1, target[device_no])
+                    candidate = (score + deviation * deviation, ranges + ((begin, stop),))
+                    previous = next_states.get(stop)
+                    if previous is None or candidate[0] < previous[0]:
+                        next_states[stop] = candidate
+            states = next_states
+            if not states:
+                insufficient("no per-GPU contiguous layer partition fits")
+        if total_layers not in states:
+            insufficient("whole decoder layers do not fit the GPU capacity boundaries")
 
         device_map = {}
-        # Top-level decoder wrappers can carry extra modalities (vision,
-        # projectors, adapters). Cover them without splitting their internals.
         for name, tensor in getattr(model, "_parameters", {}).items():
             if tensor is not None:
                 device_map[name] = self.devices[0]
@@ -1173,34 +1208,32 @@ class AccelerateMultiGPU:
         for name, module in getattr(model, "_modules", {}).items():
             if module is not None and name != "model":
                 device_map[name] = self.devices[0]
-
         for name, tensor in getattr(backbone, "_parameters", {}).items():
             if tensor is not None:
                 device_map[f"model.{name}"] = self.devices[0]
         for name, tensor in getattr(backbone, "_buffers", {}).items():
             if tensor is not None:
                 device_map[f"model.{name}"] = self.devices[0]
-
-        cursor = 0
-        for device, count in zip(self.devices, counts):
-            for layer_no in range(cursor, min(total_layers, cursor + count)):
-                device_map[f"model.layers.{layer_no}"] = device
-            cursor += count
-        while cursor < total_layers:
-            device_map[f"model.layers.{cursor}"] = self.devices[-1]
-            cursor += 1
-
         for child, _ in backbone.named_children():
-            if child == "layers":
-                continue
-            device_map[f"model.{child}"] = (
-                self.devices[-1] if child in ("norm", "final_layernorm") else self.devices[0]
-            )
+            if child != "layers":
+                device_map[f"model.{child}"] = (
+                    self.devices[-1] if child in ("norm", "final_layernorm")
+                    else self.devices[0]
+                )
 
-        self._log(
-            f"{type(model).__name__} decoder layer split: "
-            + ", ".join(f"{device}={count} layers" for device, count in zip(self.devices, counts))
-        )
+        summary = []
+        for device, (begin, stop) in zip(self.devices, states[total_layers][1]):
+            for index in range(begin, stop):
+                device_map[f"model.layers.{index}"] = device
+            summary.append(
+                f"{device}=layers.{begin}..{stop - 1} "
+                f"({(prefix[stop] - prefix[begin]) / 1024**3:.2f} GiB)"
+            )
+        self._log(f"{type(model).__name__} capacity-checked split: " + ", ".join(summary))
+        if self.verbose >= 2:
+            self._log(
+                f"Gemma tied embedding/support GPU0 budget: {support_bytes / 1024**3:.2f} GiB"
+            )
         return device_map
 
     @staticmethod
