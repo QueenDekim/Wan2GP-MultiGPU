@@ -89,6 +89,62 @@ def check_root_qwen_decoder(manager: AccelerateMultiGPU):
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
     print("[MultiGPU smoke] Qwen3-VL root decoder GPU-only forward: OK")
 
+class GemmaLike(nn.Module):
+    """Toy decoder with a tied embed_tokens/lm_head pair on GPU0."""
+
+    def __init__(self, features=192, count=10):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(256, features)
+        self.model.layers = nn.ModuleList([Block(features) for _ in range(count)])
+        self.model.norm = nn.LayerNorm(features)
+        self.lm_head = nn.Linear(features, 256, bias=False)
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(self, ids):
+        hidden = self.model.embed_tokens(ids)
+        for block in self.model.layers:
+            hidden = block(hidden)
+        return self.lm_head(self.model.norm(hidden))
+
+
+def check_gemma_vram_budget(manager):
+    """Catch the 0 GiB secondary-GPU / tied embedding OOM regression."""
+    from unittest.mock import patch
+    from accelerate import dispatch_model
+
+    root = GemmaLike().eval()
+    reference = copy.deepcopy(root).eval()
+    inputs = torch.tensor([[1, 17, 35, 200]], dtype=torch.long)
+    with torch.inference_mode():
+        expected = reference(inputs)
+
+    # Emulate the reported case: GPUs are full before text encoder dispatch.
+    with patch.object(
+        torch.cuda, "mem_get_info",
+        return_value=(256 * 1024**2, 16 * 1024**3),
+    ):
+        try:
+            manager._gemma_device_map(root)
+        except RuntimeError as exc:
+            assert "GPU-only Gemma placement impossible" in str(exc)
+        else:
+            raise AssertionError("Near-zero-VRAM Gemma map was not rejected")
+
+    device_map = manager._gemma_device_map(root)
+    assert device_map and device_map["lm_head"] == device_map["model.embed_tokens"]
+    assert set(map(str, device_map.values())) == {str(d) for d in manager.devices}
+    manager._validate_device_map_coverage("gemma-smoke", root, device_map)
+    manager._preflight_gpu_device_map("gemma-smoke", root, device_map)
+    with torch.inference_mode():
+        dispatched = dispatch_model(
+            root, device_map=device_map, main_device=manager.devices[0],
+            force_hooks=True, offload_buffers=False,
+        )
+        result = dispatched(inputs.to(manager.devices[0])).detach().cpu()
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+    print("[MultiGPU smoke] Gemma tied embeddings + VRAM preflight: OK")
+
 def check_adapter_residency(manager: AccelerateMultiGPU, model: DummyTransformer):
     model._loras_active_adapters = ["lora", "dora", "lokr"]
     model._loras_model_shortcuts = {}
@@ -176,6 +232,7 @@ def main() -> int:
         )
         check_adapter_residency(manager, model)
         check_root_qwen_decoder(manager)
+        check_gemma_vram_budget(manager)
 
     print("[MultiGPU smoke] PASS")
     return 0
