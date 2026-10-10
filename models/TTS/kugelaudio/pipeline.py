@@ -722,6 +722,6 @@ class KugelAudioPipeline:
     def release(self) -> None:
         if self.model is not None and hasattr(self.model, "release_decode_cuda_graph"):
             self.model.release_decode_cuda_graph()
-        if hasattr(self.model, "to"):
-            self.model.to("cpu")
+        # The instance is being disposed. Do not copy its CUDA weights into
+        # host RAM immediately before dropping the last reference.
         self.model = None
