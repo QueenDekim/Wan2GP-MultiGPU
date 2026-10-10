@@ -110,7 +110,8 @@ class ChatterboxPipeline:
         return {"x": wav, "audio_sampling_rate": self.sr } 
 
     def release(self) -> None:
-        if hasattr(self.model, "to"):
-            self.model.to("cpu")
+        # Do not materialize an entire CUDA-backed model in system RAM just
+        # before discarding it. The MMGP owner handles its own backing state.
         self.model = None
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
