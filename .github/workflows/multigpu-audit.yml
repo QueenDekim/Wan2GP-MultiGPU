@@ -1,0 +1,46 @@
+name: MultiGPU static compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'shared/**'
+      - 'models/**'
+      - 'preprocessing/**'
+      - 'postprocessing/**'
+      - 'scripts/audit_multigpu.py'
+      - 'wgp.py'
+      - '.github/workflows/multigpu-audit.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile core MultiGPU and model integrations
+        run: |
+          python -m py_compile \
+            wgp.py \
+            shared/multigpu_offload.py \
+            shared/kernels/int8_backend.py \
+            models/TTS/chatterbox/models/t3/modules/cond_enc.py \
+            models/TTS/chatterbox/models/voice_encoder/voice_encoder.py \
+            models/TTS/chatterbox/mtl_tts.py \
+            models/TTS/chatterbox/pipeline.py
+      - name: Inventory all model families and memory transitions
+        run: |
+          python scripts/audit_multigpu.py --out multigpu-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: multigpu-static-audit
+          path: multigpu-audit.json
+          if-no-files-found: ignore
