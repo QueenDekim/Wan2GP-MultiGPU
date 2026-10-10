@@ -180,7 +180,7 @@ class ChatterboxMultilingualTTS:
 
         conds = None
         if (builtin_voice := os.path.join(ckpt_folder,"conds.pt")) is not None:
-            conds = Conditionals.load(builtin_voice).to("cpu") #device
+            conds = Conditionals.load(builtin_voice).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
