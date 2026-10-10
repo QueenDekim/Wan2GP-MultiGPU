@@ -93,11 +93,13 @@ class ChatterboxPipeline:
                 )
 
 
+        # Prepare the reference once. Passing audio_guide again to the inner
+        # model would decode, resample and encode the same audio twice.
         self.prepare_reference(audio_guide, exaggeration)
         wav = self.model.generate(
             text=text,
             language_id=language_id,
-            audio_prompt_path=audio_guide,
+            audio_prompt_path=None,
             exaggeration=exaggeration,
             cfg_weight=cfg_weight,
             temperature=temperature,
