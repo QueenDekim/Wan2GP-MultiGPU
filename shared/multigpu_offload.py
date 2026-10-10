@@ -2484,10 +2484,20 @@ class AccelerateMultiGPU:
         )
         for no, device in enumerate(self.devices):
             free, total = torch.cuda.mem_get_info(device.index)
+            allocated = torch.cuda.memory_allocated(device.index)
+            reserved = torch.cuda.memory_reserved(device.index)
             self._log(
                 f"GPU#{no} {device}: {free / 1024**3:.2f} GiB free / "
-                f"{total / 1024**3:.2f} GiB total"
+                f"{total / 1024**3:.2f} GiB total; "
+                f"this PyTorch process allocated={allocated / 1024**3:.2f} GiB, "
+                f"reserved={reserved / 1024**3:.2f} GiB"
             )
+            if free < total * 0.15:
+                self._log(
+                    f"GPU#{no} {device}: VRAM already near capacity BEFORE "
+                    "MultiGPU model dispatch. Other GPU residents or processes "
+                    "must be freed before loading large text encoders."
+                )
         return self
 
 
