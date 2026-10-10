@@ -297,5 +297,5 @@ class ChatterboxMultilingualTTS:
             )
             # Audio remains a CUDA tensor until the outer WanGP media writer
             # explicitly transfers it for file encoding.
-            output_wav = wav.squeeze(0).detach().unsqueeze(0)
+            output_wav = wav.squeeze(0).detach().unsqueeze(0).to(self.device, non_blocking=True)
         return output_wav
