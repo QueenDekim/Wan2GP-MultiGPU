@@ -1041,7 +1041,14 @@ class AccelerateMultiGPU:
 
         import accelerate.hooks as accelerate_hooks
         import accelerate.utils.modeling as accelerate_modeling
+        import weakref
 
+        # The global Accelerate compatibility function must never own a
+        # MultiGPU instance: that instance references MMGP, all checkpoints,
+        # and their CPU backing tensors. A strong closure kept every previous
+        # model alive across model switches, potentially growing Private Bytes.
+        # Refresh the weak reference even when the patch was already installed.
+        accelerate_hooks._wgp_quanto_manager_ref = weakref.ref(self)
         if getattr(accelerate_hooks, "_wgp_quanto_patch", False):
             return
 
@@ -1077,7 +1084,10 @@ class AccelerateMultiGPU:
                 torch.cuda.current_stream(torch.device(device)).synchronize()
             except Exception:
                 pass
-            self._trim_host_working_set("Accelerate tensor streaming")
+            manager_ref = getattr(accelerate_hooks, "_wgp_quanto_manager_ref", None)
+            manager = manager_ref() if callable(manager_ref) else None
+            if manager is not None:
+                manager._trim_host_working_set("Accelerate tensor streaming")
 
         def set_module_tensor_to_device_compat(
             module, tensor_name, device, value=None, dtype=None,
