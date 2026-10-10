@@ -47,6 +47,48 @@ class DummyTransformer(nn.Module):
         return self.head(value)
 
 
+class Qwen3VLTextModel(nn.Module):
+    """Tiny root-layer Qwen3-VL stand-in, without external checkpoints."""
+
+    def __init__(self, features: int = 192, count: int = 10):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(256, features)
+        self.layers = nn.ModuleList([Block(features) for _ in range(count)])
+        self.norm = nn.LayerNorm(features)
+        self.rotary_emb = nn.Identity()
+
+    def forward(self, ids: torch.LongTensor) -> torch.Tensor:
+        hidden = self.embed_tokens(ids)
+        for block in self.layers:
+            hidden = block(hidden)
+        return self.norm(hidden)
+
+
+def check_root_qwen_decoder(manager: AccelerateMultiGPU):
+    root = Qwen3VLTextModel().eval()
+    cpu_reference = copy.deepcopy(root).eval()
+    tokens = torch.tensor([[1, 17, 35, 200]], dtype=torch.long)
+    with torch.inference_mode():
+        expected = cpu_reference(tokens)
+
+    device_map = manager._qwen3vl_text_device_map(root)
+    assert device_map and "layers.0" in device_map
+    assert "layers.9" in device_map and "embed_tokens" in device_map
+    assert "norm" in device_map and "rotary_emb" in device_map
+    assert set(map(str, device_map.values())) == {str(d) for d in manager.devices}
+    manager._validate_device_map_coverage("qwen3vl-smoke", root, device_map)
+
+    from accelerate import dispatch_model
+
+    with torch.inference_mode():
+        root = dispatch_model(
+            root, device_map=device_map, main_device=manager.devices[0],
+            force_hooks=True, offload_buffers=False,
+        )
+        actual = root(tokens.to(manager.devices[0])).detach().cpu()
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    print("[MultiGPU smoke] Qwen3-VL root decoder GPU-only forward: OK")
+
 def check_adapter_residency(manager: AccelerateMultiGPU, model: DummyTransformer):
     model._loras_active_adapters = ["lora", "dora", "lokr"]
     model._loras_model_shortcuts = {}
@@ -133,6 +175,7 @@ def main() -> int:
             f"result device: {result.device}"
         )
         check_adapter_residency(manager, model)
+        check_root_qwen_decoder(manager)
 
     print("[MultiGPU smoke] PASS")
     return 0
