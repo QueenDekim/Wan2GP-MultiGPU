@@ -14258,7 +14258,7 @@ def create_ui():
             f'<br>MultiGPU by '
             f'<a href="https://github.com/QueenDekim" target="_blank" rel="noopener noreferrer">QueenDekim</a>'
             f'</div></div>'
-        )")
+        )
         global model_list
 
         tab_state = gr.State({ "tab_no":0 }) 
