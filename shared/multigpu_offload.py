@@ -966,6 +966,10 @@ class AccelerateMultiGPU:
             "WanTransformerBlock",
             "Wan2TransformerBlock",
         }
+        stages = self._block_pipeline_stages(model)
+        for _, blocks, _ in stages:
+            if blocks:
+                common.add(blocks[0].__class__.__name__)
         known = {module.__class__.__name__ for module in self._iter_modules_unique(model)}
         for name in common:
             if name in known and name not in classes:
@@ -1288,6 +1292,51 @@ class AccelerateMultiGPU:
             stages.append(("visual_transformer_blocks", model.visual_transformer_blocks, "Kandinsky5"))
             return stages
 
+        # Hugging Face decoder wrappers (Gemma, Qwen, Llama and multimodal
+        # variants) are mapped by the decoder-specific strategies above, but
+        # still expose contiguous decoder layers to the hybrid LoRA cache.
+        backbone = getattr(model, "model", None)
+        decoder_layers = getattr(backbone, "layers", None)
+        if isinstance(decoder_layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+            if len(decoder_layers) >= len(self.devices):
+                return [("model.layers", decoder_layers, "HF-decoder")]
+
+        language_model = getattr(model, "language_model", None)
+        backbone = getattr(language_model, "model", None)
+        decoder_layers = getattr(backbone, "layers", None)
+        if isinstance(decoder_layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+            if len(decoder_layers) >= len(self.devices):
+                return [("language_model.model.layers", decoder_layers, "LLaVA-decoder")]
+
+        # Many newer WanGP architectures have a single, sequential
+        # transformer backbone rather than the historical Wan/LTX block names.
+        # The fallback is intentionally conservative: only recognised root
+        # ModuleLists/Sequentials holding most of the model weights qualify.
+        # Unknown multi-stage control-flow remains with the generic allocator.
+        candidates = (
+            "transformer_blocks",
+            "blocks",
+            "joint_transformer_blocks",
+            "single_transformer_blocks",
+            "joint_blocks",
+            "dit_blocks",
+            "layers",
+        )
+        minimum_blocks = max(4, len(self.devices))
+        for name in candidates:
+            blocks = getattr(model, name, None)
+            if not isinstance(blocks, (torch.nn.ModuleList, torch.nn.Sequential)):
+                continue
+            if len(blocks) < minimum_blocks:
+                continue
+            total_bytes = self._module_nbytes(model)
+            if total_bytes <= 0:
+                continue
+            block_bytes = sum(self._module_nbytes(block) for block in blocks)
+            if block_bytes < total_bytes * 0.60:
+                continue
+            return [(name, blocks, f"{type(model).__name__}/{name}")]
+
         return []
 
     def _weighted_top_level_pipeline_map(self, model):
@@ -1298,7 +1347,10 @@ class AccelerateMultiGPU:
         forward code always begins and ends on the primary GPU.
         """
         stages = self._block_pipeline_stages(model)
-        if not stages or stages[0][0].startswith("velocity_model."):
+        # Nested decoder and LTX2 paths have dedicated maps. This builder
+        # handles only root ModuleLists so all non-block support layers are
+        # guaranteed to be covered on the primary GPU.
+        if not stages or any("." in stage_path for stage_path, _, _ in stages):
             return None
 
         flattened = []
