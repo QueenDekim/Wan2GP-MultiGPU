@@ -21,12 +21,21 @@ class T3Cond:
     cond_prompt_speech_emb: Optional[Tensor] = None
     emotion_adv: Optional[Tensor] = 0.5
 
-    def to(self, *, device=None, dtype=None):
-        "Cast to a device and dtype. Dtype casting is ignored for long/int tensors."
-        for k, v in self.__dict__.items():
-            if torch.is_tensor(v):
-                is_fp = type(v.view(-1)[0].item()) is not int
-                setattr(self, k, v.to(device=device, dtype=dtype if is_fp else None))
+    def to(self, device=None, *, dtype=None, non_blocking=False):
+        """Move conditioning tensors to the execution device.
+
+        Accelerate passes the device positionally and may pass non_blocking.
+        Keep tokens integer-valued and preserve in-place transfer semantics.
+        """
+        for name, value in self.__dict__.items():
+            if not torch.is_tensor(value):
+                continue
+            target_dtype = dtype if (value.is_floating_point() or value.is_complex()) else None
+            setattr(
+                self,
+                name,
+                value.to(device=device, dtype=target_dtype, non_blocking=non_blocking),
+            )
         return self
 
     def save(self, fpath):
