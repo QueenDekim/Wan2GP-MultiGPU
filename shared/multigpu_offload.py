@@ -1796,6 +1796,67 @@ class AccelerateMultiGPU:
             self._log(f"pre-positioned {moved} direct parameter/buffer device-map tensor(s)")
         return moved
 
+    def _validate_device_map_coverage(self, model_id, model, device_map):
+        """Reject missing tensors and divergent placement of tied parameters.
+
+        A partial explicit map can silently strand root buffers on CPU, which
+        then fails during forward or corrupts outputs on less common models.
+        Check the complete model graph before any destructive GPU dispatch.
+        """
+        if not device_map:
+            raise RuntimeError(f"{model_id}: empty MultiGPU device map")
+        if "" in device_map:
+            return  # A whole-model assignment covers every tensor.
+
+        assigned = {}
+        missing = []
+        tied = {}
+        for iterator in (
+            model.named_parameters(recurse=True, remove_duplicate=False),
+            model.named_buffers(recurse=True, remove_duplicate=False),
+        ):
+            for name, tensor in iterator:
+                matching = name if name in device_map else None
+                if matching is None:
+                    prefix = name
+                    while "." in prefix:
+                        prefix = prefix.rsplit(".", 1)[0]
+                        if prefix in device_map:
+                            matching = prefix
+                            break
+                if matching is None:
+                    missing.append(name)
+                    continue
+                target = str(torch.device(device_map[matching]))
+                assigned[target] = assigned.get(target, 0) + 1
+
+                # Tied parameters must not be pulled into multiple distinct
+                # GPU allocations, especially for large LM input/output
+                # embeddings. Ignore identity-equal meta buffers only when
+                # there is no actual underlying storage to tie.
+                if not getattr(tensor, "is_meta", False):
+                    key = id(tensor)
+                    prev = tied.get(key)
+                    if prev is not None and prev[0] != target:
+                        raise RuntimeError(
+                            f"{model_id}: tied tensor {prev[1]!r} and {name!r} "
+                            f"mapped to different devices ({prev[0]} vs {target})"
+                        )
+                    tied[key] = (target, name)
+
+        if missing:
+            preview = ", ".join(missing[:12])
+            raise RuntimeError(
+                f"{model_id}: incomplete GPU-only device map "
+                f"({len(missing)} uncovered parameters/buffers): {preview}"
+            )
+
+        if self.verbose >= 2:
+            self._log(
+                f"{model_id}: device map covers all tensors; "
+                + ", ".join(f"{dev}={count}" for dev, count in assigned.items())
+            )
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -1859,6 +1920,8 @@ class AccelerateMultiGPU:
                 offload_buffers=False,
                 fallback_allocation=True,
             )
+
+        self._validate_device_map_coverage(model_id, model, device_map)
 
         counts = {}
         for device in device_map.values():
@@ -1996,7 +2059,19 @@ class AccelerateMultiGPU:
         if blocks_name is not None:
             return
 
-        model = self._dispatch(model_id)
+        try:
+            model = self._dispatch(model_id)
+        except Exception:
+            # Map inference and coverage checks happen before dispatch_model's
+            # own rollback handler. Always restore MMGP hooks even when an
+            # architecture is rejected before Accelerate touches its weights.
+            if model_id not in self.dispatched:
+                try:
+                    self._move_model_to_cpu(self.offload.models[model_id])
+                except Exception:
+                    self._restore_mmgp_blocks(model_id)
+                    self._restore_mmgp_forwards(model_id)
+            raise
         self.offload.loaded_blocks[model_id] = None
 
         # Keep MMGP's own residency bookkeeping coherent. ensure_model_loaded()
