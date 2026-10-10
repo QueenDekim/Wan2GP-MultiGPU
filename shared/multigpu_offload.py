@@ -2024,6 +2024,74 @@ class AccelerateMultiGPU:
                 + ", ".join(f"{dev}={count}" for dev, count in assigned.items())
             )
 
+    def _preflight_gpu_device_map(self, model_id, model, device_map):
+        """Prevent doomed GPU-only dispatches before allocating weight copies.
+
+        Evaluate the actual mapped parameter and buffer bytes per CUDA device,
+        including quantized backing tensors and tied-weight deduplication.
+        Unlike EmptyWorkingSet, this explicitly checks VRAM rather than RAM.
+        """
+        missing = {str(device): 0 for device in self.devices}
+        seen = set()
+        for iterator in (
+            model.named_parameters(recurse=True, remove_duplicate=False),
+            model.named_buffers(recurse=True, remove_duplicate=False),
+        ):
+            for name, tensor in iterator:
+                if not torch.is_tensor(tensor) or id(tensor) in seen:
+                    continue
+                seen.add(id(tensor))
+                path = name
+                while path not in device_map and "." in path:
+                    path = path.rsplit(".", 1)[0]
+                placement = device_map.get(path, device_map.get(""))
+                if placement is None:
+                    continue  # Coverage validation reports this separately.
+                target = torch.device(
+                    f"cuda:{placement}" if isinstance(placement, int) else placement
+                )
+                if target.type != "cuda":
+                    continue
+                # An already resident parameter does not need another copy.
+                if tensor.device == target:
+                    continue
+                key = str(target)
+                missing[key] = missing.get(key, 0) + self._tensor_nbytes(tensor)
+
+        deficits = []
+        for device in self.devices:
+            free, total = torch.cuda.mem_get_info(device.index)
+            allocated = torch.cuda.memory_allocated(device.index)
+            reserved = torch.cuda.memory_reserved(device.index)
+            required = missing.get(str(device), 0)
+            # Keep at least 256 MiB for the Accelerate hook setup and avoid
+            # assuming every currently free byte belongs to this process.
+            guard = 256 * 1024**2
+            available_for_weights = max(0, int(free * self.fraction) - guard)
+            self._log(
+                f"{model_id}: preflight {device}: "
+                f"free={free / 1024**3:.2f}/{total / 1024**3:.2f} GiB, "
+                f"PyTorch allocated={allocated / 1024**3:.2f} GiB, "
+                f"reserved={reserved / 1024**3:.2f} GiB, "
+                f"new weights={required / 1024**3:.2f} GiB, "
+                f"budget={available_for_weights / 1024**3:.2f} GiB"
+            )
+            if required > available_for_weights:
+                deficits.append(
+                    f"{device} needs {required / 1024**3:.2f} GiB new weights "
+                    f"but its safe budget is {available_for_weights / 1024**3:.2f} GiB"
+                )
+        if deficits:
+            active = getattr(self.offload, "active_models_ids", None)
+            raise RuntimeError(
+                f"{model_id}: GPU-only dispatch prevented before CUDA OOM. "
+                + "; ".join(deficits)
+                + f". MMGP active models: {active}. "
+                "Unnecessary GPU residents must be unloaded first; "
+                "otherwise restart WanGP or use a smaller checkpoint. "
+                "RAM/disk fallback remains disabled."
+            )
+
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
 
@@ -2035,7 +2103,12 @@ class AccelerateMultiGPU:
         self._detach_registered_module_cycles(model_id, model)
         self._ensure_state_dict_compat(model_id, model)
         self._remove_accelerate_hooks(model)
-        self._suspend_mmgp_forwards(model_id, model)
+        # Discard only allocator-owned free blocks from previous stages before
+        # assessing current VRAM; never move live model tensors to host RAM.
+        gc.collect()
+        for device in self.devices:
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
 
         # Gemma uses tied input/output embeddings. Accelerate warns about this
         # when inferring a device map and may otherwise put lm_head on disk.
@@ -2160,7 +2233,12 @@ class AccelerateMultiGPU:
                 if name in device_map:
                     self._log(f"{model_id}: {name} -> {device_map[name]}")
 
+        self._preflight_gpu_device_map(model_id, model, device_map)
+
         self._patch_accelerate_quanto()
+        # Suspend MMGP only after capacity/coverage checks have succeeded.
+        # A failed map should never leave MMGP forward hooks disabled.
+        self._suspend_mmgp_forwards(model_id, model)
         self._preplace_direct_device_map_tensors(model, device_map)
 
         # From this point until unload(), MMGP must not be allowed to perform
