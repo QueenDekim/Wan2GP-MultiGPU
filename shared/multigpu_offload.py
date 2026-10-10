@@ -870,16 +870,52 @@ class AccelerateMultiGPU:
 
         self._unload_dispatched_loras(model)
 
-        original_blocks = self._suspended_mmgp_blocks.get(model_id) if model_id is not None else None
+        # MMGP registers the base tensors of a model in *multiple* block
+        # registries: the root key (e.g. "text_encoder") AND its sequential
+        # blocks ("text_encoder/model.layers.0", ...). Restoring only the root
+        # leaves every decoder/transformer layer resident on CUDA after unload.
+        # In particular this leaked ~10 GiB of LTX2's Gemma decoder across
+        # two 16-GiB GPUs. Reattach the ORIGINAL references; .to("cpu") would
+        # duplicate all the weights in the host's scarce private RAM.
+        restored = 0
+        failed = []
+        registered = getattr(self.offload, "blocks_of_modules", {})
         if model_id is not None:
-            for parent, name, source, is_buffer, tied in (original_blocks or getattr(self.offload, "blocks_of_modules", {}).get(model_id, [])):
-                try:
-                    if tied is not None:
-                        setattr(parent, name, getattr(tied[0], tied[1]))
-                    else:
-                        setattr(parent, name, source)
-                except Exception:
-                    pass
+            original_root = self._suspended_mmgp_blocks.get(model_id)
+            entries = []
+            for entry_name, entry_blocks in registered.items():
+                if entry_name != model_id and not entry_name.startswith(model_id + "/"):
+                    continue
+                if entry_name == model_id and original_root is not None:
+                    entry_blocks = original_root
+                entries.extend(entry_blocks or [])
+            if original_root is not None and model_id not in registered:
+                entries.extend(original_root)
+
+            # Restore physical backing tensors before resolving tied aliases.
+            # MMGP's tied refs point to other registered (parent, name) pairs,
+            # which must no longer contain Accelerate's temporary CUDA copies.
+            for pass_tied in (False, True):
+                for parent, name, source, is_buffer, tied in entries:
+                    if (tied is not None) != pass_tied:
+                        continue
+                    try:
+                        replacement = getattr(tied[0], tied[1]) if tied is not None else source
+                        setattr(parent, name, replacement)
+                        restored += 1
+                    except Exception as exc:
+                        failed.append(f"{type(parent).__name__}.{name}: {exc}")
+
+            if self.verbose >= 1:
+                self._log(
+                    f"{model_id}: restored {restored} original MMGP tensors "
+                    f"from root and nested block registries"
+                )
+            if failed:
+                self._log(
+                    f"{model_id}: WARNING: failed to restore {len(failed)} "
+                    f"MMGP tensors: {'; '.join(failed[:4])}"
+                )
 
         for module in self._iter_modules_unique(model):
             # Do not call Accelerate's normal detach path here: for Quanto it
