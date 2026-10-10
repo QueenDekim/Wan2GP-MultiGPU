@@ -159,14 +159,20 @@ class VoiceEncoder(nn.Module):
         # L2 normalize the embeddings.
         return raw_embeds / torch.linalg.norm(raw_embeds, dim=1, keepdim=True)
 
-    def inference(self, mels: torch.Tensor, mel_lens, overlap=0.5, rate: float=None, min_coverage=0.8, batch_size=None):
+    def inference(self, mels: torch.Tensor, mel_lens, overlap=0.5, rate: float=None, min_coverage=0.8, batch_size=None, output_device=None):
         """
         Computes the embeddings of a batch of full utterances with gradients.
 
         :param mels: (B, T, M) unscaled mels
-        :return: (B, E) embeddings on CPU
+        :return: (B, E) embeddings on the requested device (default: mels.device)
         """
         mel_lens = mel_lens.tolist() if torch.is_tensor(mel_lens) else mel_lens
+
+        # Keep mel inputs and all intermediate embeddings on the computation
+        # device, even if MMGP's weight hooks temporarily offload parameters.
+        compute_device = torch.device(output_device) if output_device is not None else mels.device
+        if mels.device != compute_device:
+            mels = mels.to(compute_device, non_blocking=True)
 
         # Compute where to split the utterances into partials
         frame_step = get_frame_step(overlap, rate, self.hp)
@@ -188,13 +194,14 @@ class VoiceEncoder(nn.Module):
 
         # Forward the partials
         n_chunks = int(np.ceil(len(partials) / (batch_size or len(partials))))
-        # MMGP/Accelerate can return chunk embeddings on different devices as
-        # hooks move the voice encoder between CPU and CUDA. This API already
-        # promises CPU embeddings; normalize each small result before cat.
-        # Avoid accumulating all chunk outputs in VRAM or transferring the
-        # entire concatenated result at once.
+        # MMGP/Accelerate hooks may return different chunks on different
+        # devices. Keep every embedding on the inference device before
+        # concatenation; never copy intermediate embeddings into host RAM.
         partial_embeds = torch.cat(
-            [self(batch).to(device="cpu") for batch in partials.chunk(n_chunks)],
+            [
+                self(batch).to(device=compute_device, non_blocking=True)
+                for batch in partials.chunk(n_chunks)
+            ],
             dim=0,
         )
 
@@ -226,7 +233,7 @@ class VoiceEncoder(nn.Module):
         return embeds_x @ embeds_y
 
     def embeds_from_mels(
-        self, mels: Union[Tensor, List[np.ndarray]], mel_lens=None, as_spk=False, batch_size=32, **kwargs
+        self, mels: Union[Tensor, List[np.ndarray]], mel_lens=None, as_spk=False, batch_size=32, return_tensor=False, output_device=None, **kwargs
     ):
         """
         Convenience function for deriving utterance or speaker embeddings from mel spectrograms.
@@ -245,11 +252,22 @@ class VoiceEncoder(nn.Module):
             mel_lens = [mel.shape[0] for mel in mels]
             mels = pack(mels)
 
-        # Embed them
+        # Chatterbox uses return_tensor=True to keep the entire computation
+        # on GPU. Legacy callers can still request NumPy at the API boundary.
+        compute_device = torch.device(output_device) if output_device is not None else self.device
         with torch.inference_mode():
-            utt_embeds = self.inference(mels.to(self.device), mel_lens, batch_size=batch_size, **kwargs).numpy()
+            utt_embeds = self.inference(
+                mels.to(compute_device, non_blocking=True),
+                mel_lens,
+                batch_size=batch_size,
+                output_device=compute_device,
+                **kwargs,
+            )
+            if as_spk:
+                utt_embeds = utt_embeds.mean(dim=0)
+                utt_embeds = utt_embeds / torch.linalg.vector_norm(utt_embeds, ord=2)
 
-        return self.utt_to_spk_embed(utt_embeds) if as_spk else utt_embeds
+        return utt_embeds if return_tensor else utt_embeds.cpu().numpy()
 
     def embeds_from_wavs(
         self,
@@ -258,6 +276,8 @@ class VoiceEncoder(nn.Module):
         as_spk=False,
         batch_size=32,
         trim_top_db: Optional[float]=20,
+        return_tensor=False,
+        output_device=None,
         **kwargs
     ):
         """
@@ -279,4 +299,4 @@ class VoiceEncoder(nn.Module):
 
         mels = [melspectrogram(w, self.hp).T for w in wavs]
 
-        return self.embeds_from_mels(mels, as_spk=as_spk, batch_size=batch_size, **kwargs)
+        return self.embeds_from_mels(mels, as_spk=as_spk, batch_size=batch_size, return_tensor=return_tensor, output_device=output_device, **kwargs)
