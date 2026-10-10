@@ -1292,6 +1292,17 @@ class AccelerateMultiGPU:
             stages.append(("visual_transformer_blocks", model.visual_transformer_blocks, "Kandinsky5"))
             return stages
 
+        # MiniMax H3 uses the root Qwen3-VL text decoder without a
+        # nested "model" wrapper. It must participate in block-JIT LoRA
+        # residency even when its large embedding table exceeds 40% of
+        # the parameter storage.
+        root_layers = getattr(model, "layers", None)
+        if (
+            type(model).__name__ == "Qwen3VLTextModel"
+            and isinstance(root_layers, (torch.nn.ModuleList, torch.nn.Sequential))
+            and len(root_layers) >= len(self.devices)
+        ):
+            return [("layers", root_layers, "Qwen3-VL") ]
         # Hugging Face decoder wrappers (Gemma, Qwen, Llama and multimodal
         # variants) are mapped by the decoder-specific strategies above, but
         # still expose contiguous decoder layers to the hybrid LoRA cache.
@@ -1477,6 +1488,128 @@ class AccelerateMultiGPU:
                 f"{label} primary support weights: "
                 f"{primary_support_bytes / 1024**3:.2f} GiB on {self.devices[0]}; "
                 f"activation reserve={reserve / 1024**3:.2f} GiB/device"
+            )
+        return device_map
+
+    def _qwen3vl_text_device_map(self, model):
+        """GPU-only whole-layer map for MiniMax H3 Qwen3VLTextModel.
+
+        The Qwen3-VL text backbone exposes 50 decoder layers directly at
+        model.layers rather than model.model.layers. Its embedding table is
+        large enough that the generic 60%-of-weights block heuristic does
+        not reliably recognize this as a sequential decoder. Reserve actual
+        VRAM for root embeddings and assign only contiguous whole layers.
+        Reject checkpoints that cannot fit; never silently offload to RAM.
+        """
+        layers = getattr(model, "layers", None)
+        if (
+            type(model).__name__ != "Qwen3VLTextModel"
+            or not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential))
+            or len(layers) < len(self.devices)
+        ):
+            return None
+
+        layer_bytes = [max(1, self._module_nbytes(layer)) for layer in layers]
+        total_layers = len(layers)
+        total_layer_bytes = sum(layer_bytes)
+        root_support_bytes = 0
+        for name, tensor in getattr(model, "_parameters", {}).items():
+            if tensor is not None:
+                root_support_bytes += self._tensor_nbytes(tensor)
+        for name, tensor in getattr(model, "_buffers", {}).items():
+            if tensor is not None:
+                root_support_bytes += self._tensor_nbytes(tensor)
+        for name, module in getattr(model, "_modules", {}).items():
+            if module is not None and name != "layers":
+                root_support_bytes += self._module_nbytes(module)
+
+        # Text encoding has much smaller activation peaks than video denoising,
+        # but the embedding lookup, rotary arguments and allocator still need
+        # breathing room. GPU0 pays the support-module cost explicitly.
+        capacities = []
+        free_bytes = []
+        for index, device in enumerate(self.devices):
+            free, _ = torch.cuda.mem_get_info(device.index)
+            free_bytes.append(int(free))
+            guard = (768 if index == 0 else 512) * 1024**2
+            support = root_support_bytes if index == 0 else 0
+            capacities.append(max(0, int(free * self.fraction) - guard - support))
+
+        total_capacity = sum(capacities)
+        if total_layer_bytes > total_capacity:
+            needed = (total_layer_bytes + root_support_bytes) / 1024**3
+            accessible = sum(free_bytes) / 1024**3
+            raise RuntimeError(
+                f"MiniMax H3 Qwen3-VL text encoder needs ~{needed:.2f} GiB "
+                f"packed GPU weights, but only {accessible:.2f} GiB VRAM is "
+                f"currently free across {len(self.devices)} GPU(s) "
+                f"(safe decoder budget {total_capacity / 1024**3:.2f} GiB). "
+                "MultiGPU remains GPU-only: select a smaller Text Encoder "
+                "checkpoint in MiniMax H3 settings (NVFP4 AWQ, GGUF Q4_K_M, "
+                "or GGUF Q2_K), or free VRAM on the GPUs. "
+                "Host RAM/disk offload is disabled."
+            )
+
+        # Find contiguous layer ranges that all actually fit. A plain
+        # proportional split can still OOM due to one large decoder layer.
+        prefix = [0]
+        for amount in layer_bytes:
+            prefix.append(prefix[-1] + amount)
+        target = [total_layer_bytes * value / max(1, total_capacity) for value in capacities]
+        states = {0: (0.0, ())}
+        for device_no, capacity in enumerate(capacities):
+            next_states = {}
+            remaining_devices = len(self.devices) - device_no - 1
+            for start, (score, ranges) in states.items():
+                upper = total_layers - remaining_devices
+                for end in range(start + 1, upper + 1):
+                    weight = prefix[end] - prefix[start]
+                    if weight > capacity:
+                        break
+                    if remaining_devices == 0 and end != total_layers:
+                        continue
+                    delta = (weight - target[device_no]) / max(1.0, target[device_no])
+                    candidate = (score + delta * delta, ranges + ((start, end),))
+                    previous = next_states.get(end)
+                    if previous is None or candidate[0] < previous[0]:
+                        next_states[end] = candidate
+            states = next_states
+            if not states:
+                break
+        if total_layers not in states:
+            raise RuntimeError(
+                "MiniMax H3 Qwen3-VL: no feasible whole-layer GPU split at "
+                "the current free VRAM levels. Free GPU memory or choose "
+                "GGUF Q4_K_M / Q2_K; host RAM fallback is disabled."
+            )
+
+        ranges = states[total_layers][1]
+        device_map = {}
+        for name, tensor in getattr(model, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, tensor in getattr(model, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, module in getattr(model, "_modules", {}).items():
+            if module is None or name == "layers":
+                continue
+            device_map[name] = self.devices[-1] if name == "norm" else self.devices[0]
+
+        distribution = []
+        for device, (start, end) in zip(self.devices, ranges):
+            for idx in range(start, end):
+                device_map[f"layers.{idx}"] = device
+            amount = (prefix[end] - prefix[start]) / 1024**3
+            distribution.append(f"{device}=layers.{start}..{end-1} ({amount:.2f} GiB)")
+        self._log(
+            "Qwen3-VL 50-layer GPU-only contiguous split: " + ", ".join(distribution)
+        )
+        if self.verbose >= 2:
+            self._log(
+                "Qwen3-VL primary support: "
+                f"{root_support_bytes / 1024**3:.2f} GiB; "
+                f"decoder weights {total_layer_bytes / 1024**3:.2f} GiB"
             )
         return device_map
 
@@ -1896,6 +2029,10 @@ class AccelerateMultiGPU:
         ):
             # LTX2 X0Model.
             device_map = self._ltx2_device_map(model)
+        elif type(model).__name__ == "Qwen3VLTextModel":
+            # MiniMax H3/Qwen3-VL exposes a root ModuleList, not model.layers.
+            # The generic allocator otherwise sends the last layers to disk.
+            device_map = self._qwen3vl_text_device_map(model)
         elif (
             getattr(getattr(model, "language_model", None), "model", None) is not None
             and getattr(getattr(getattr(model, "language_model", None), "model", None), "layers", None) is not None
