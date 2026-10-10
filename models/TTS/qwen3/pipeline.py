@@ -968,8 +968,7 @@ class Qwen3TTSPipeline:
     def release(self) -> None:
         if self.model is not None and hasattr(self.model, "release_decode_cuda_graph"):
             self.model.release_decode_cuda_graph()
-        for module in [self.model, getattr(self.speech_tokenizer, "model", None)]:
-            if hasattr(module, "to"):
-                module.to("cpu")
+        # Releasing a pipeline should drop model references, not materialize
+        # every GPU tensor in system RAM before garbage collection.
         self.model = None
         self.speech_tokenizer = None
