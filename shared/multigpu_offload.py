@@ -1827,7 +1827,8 @@ class AccelerateMultiGPU:
                 if matching is None:
                     missing.append(name)
                     continue
-                target = str(torch.device(device_map[matching]))
+                placement = device_map[matching]
+                target = str(torch.device(f"cuda:{placement}" if isinstance(placement, int) else placement))
                 assigned[target] = assigned.get(target, 0) + 1
 
                 # Tied parameters must not be pulled into multiple distinct
