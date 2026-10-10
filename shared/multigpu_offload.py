@@ -1125,7 +1125,7 @@ class AccelerateMultiGPU:
         """
         backbone = getattr(model, "model", None)
         layers = getattr(backbone, "layers", None)
-        if layers is None or len(layers) < 2 or len(self.devices) < 2:
+        if layers is None or len(layers) < len(self.devices) or len(self.devices) < 2:
             return None
 
         total_layers = len(layers)
@@ -1157,10 +1157,25 @@ class AccelerateMultiGPU:
                     counts[donor] -= 1
                     counts[empty_i] += 1
 
-        device_map = {
-            "model.embed_tokens": self.devices[0],
-            "lm_head": self.devices[0],
-        }
+        device_map = {}
+        # Top-level decoder wrappers can carry extra modalities (vision,
+        # projectors, adapters). Cover them without splitting their internals.
+        for name, tensor in getattr(model, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, tensor in getattr(model, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, module in getattr(model, "_modules", {}).items():
+            if module is not None and name != "model":
+                device_map[name] = self.devices[0]
+
+        for name, tensor in getattr(backbone, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[f"model.{name}"] = self.devices[0]
+        for name, tensor in getattr(backbone, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[f"model.{name}"] = self.devices[0]
 
         cursor = 0
         for device, count in zip(self.devices, counts):
@@ -1172,11 +1187,14 @@ class AccelerateMultiGPU:
             cursor += 1
 
         for child, _ in backbone.named_children():
-            if child not in ("layers", "embed_tokens"):
-                device_map[f"model.{child}"] = self.devices[-1]
+            if child == "layers":
+                continue
+            device_map[f"model.{child}"] = (
+                self.devices[-1] if child in ("norm", "final_layernorm") else self.devices[0]
+            )
 
         self._log(
-            "Gemma layer split: "
+            f"{type(model).__name__} decoder layer split: "
             + ", ".join(f"{device}={count} layers" for device, count in zip(self.devices, counts))
         )
         return device_map
@@ -1457,6 +1475,24 @@ class AccelerateMultiGPU:
             start = end
 
         device_map = {}
+        for name, tensor in getattr(model, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, tensor in getattr(model, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[name] = self.devices[0]
+        for name, tensor in getattr(language_model, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[f"language_model.{name}"] = self.devices[0]
+        for name, tensor in getattr(language_model, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[f"language_model.{name}"] = self.devices[0]
+        for name, tensor in getattr(backbone, "_parameters", {}).items():
+            if tensor is not None:
+                device_map[f"language_model.model.{name}"] = self.devices[0]
+        for name, tensor in getattr(backbone, "_buffers", {}).items():
+            if tensor is not None:
+                device_map[f"language_model.model.{name}"] = self.devices[0]
         # Vision/projector side stays on primary.
         for child_name, child in getattr(model, "_modules", {}).items():
             if child is not None and child_name != "language_model":
