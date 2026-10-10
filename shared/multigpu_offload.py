@@ -2395,8 +2395,25 @@ class AccelerateMultiGPU:
             self._mark_inactive(model_id)
             return
         self._log_host_commit(f"{model_id} before unload")
+        allocations_before = {
+            str(device): torch.cuda.memory_allocated(device.index)
+            for device in self.devices
+        }
         self._log(f"{model_id}: stage complete; releasing all dispatched GPU weights")
         self._move_model_to_cpu(model)
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._log(
+            f"{model_id}: PyTorch GPU allocation after unload: "
+            + ", ".join(
+                f"{device}: "
+                f"{allocations_before[str(device)] / 1024**3:.2f} -> "
+                f"{torch.cuda.memory_allocated(device.index) / 1024**3:.2f} GiB "
+                f"(released "
+                f"{(allocations_before[str(device)] - torch.cuda.memory_allocated(device.index)) / 1024**3:.2f} GiB)"
+                for device in self.devices
+            )
+        )
         self._log_host_commit(f"{model_id} after unload")
         self._mark_inactive(model_id, model)
         self.offload.loaded_blocks[model_id] = None
