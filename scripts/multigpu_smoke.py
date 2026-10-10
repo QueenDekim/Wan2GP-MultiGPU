@@ -108,6 +108,47 @@ class GemmaLike(nn.Module):
         return self.lm_head(self.model.norm(hidden))
 
 
+def check_nested_mmgp_restore(manager):
+    """Ensure unload restores all MMGP child block tensors, not just root."""
+    backing = GemmaLike(features=32, count=4).eval()
+    source_root = backing.model.embed_tokens.weight
+    source_first = backing.model.layers[0].linear.weight
+    source_last = backing.model.layers[-1].linear.bias
+    # Simulate Accelerate replacing CPU-backed originals with CUDA/sharded
+    # copies. Distinct CPU tensors suffice to test reference restoration.
+    original_tie = backing.lm_head.weight
+    backing.model.embed_tokens.weight = nn.Parameter(torch.randn_like(source_root))
+    backing.lm_head.weight = backing.model.embed_tokens.weight
+    backing.model.layers[0].linear.weight = nn.Parameter(torch.randn_like(source_first))
+    backing.model.layers[-1].linear.bias = nn.Parameter(torch.randn_like(source_last))
+    assert backing.model.layers[0].linear.weight is not source_first
+
+    registry = {
+        "nested_restore": [],
+        "nested_restore/model.layers.0": [
+            (backing.model.layers[0].linear, "weight", source_first, False, None),
+        ],
+        "nested_restore/model.layers.3": [
+            (backing.model.layers[-1].linear, "bias", source_last, False, None),
+        ],
+    }
+    root_blocks = [
+        (backing.model.embed_tokens, "weight", source_root, False, None),
+        (backing.lm_head, "weight", original_tie, False, (backing.model.embed_tokens, "weight")),
+    ]
+    manager.offload.models["nested_restore"] = backing
+    manager.offload.blocks_of_modules = registry
+    manager._suspended_mmgp_blocks["nested_restore"] = root_blocks
+    manager._move_model_to_cpu(backing)
+    assert backing.model.embed_tokens.weight is source_root
+    assert backing.lm_head.weight is source_root
+    assert backing.model.layers[0].linear.weight is source_first
+    assert backing.model.layers[-1].linear.bias is source_last
+    assert registry["nested_restore"] is root_blocks
+    print("[MultiGPU smoke] Nested MMGP block / tied weight restoration: OK")
+    del manager.offload.models["nested_restore"]
+    del manager.offload.blocks_of_modules
+
 def check_gemma_vram_budget(manager):
     """Catch the 0 GiB secondary-GPU / tied embedding OOM regression."""
     from unittest.mock import patch
@@ -233,6 +274,7 @@ def main() -> int:
         check_adapter_residency(manager, model)
         check_root_qwen_decoder(manager)
         check_gemma_vram_budget(manager)
+        check_nested_mmgp_restore(manager)
 
     print("[MultiGPU smoke] PASS")
     return 0
