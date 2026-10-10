@@ -6,7 +6,7 @@ class AboutPlugin(WAN2GPPlugin):
         super().__init__()
         self.name = "About Tab"
         self.version = "1.0.0"
-        self.description = "Credits for the creator and all co-creators of WAN2GP"
+        self.description = "Wan2GP by DeepBeepMeep, MultiGPU architecture by QueenDekim, and project contributors"
 
     def setup_ui(self):
         self.add_tab(
@@ -16,7 +16,22 @@ class AboutPlugin(WAN2GPPlugin):
         )
 
     def create_about_ui(self):
-        gr.Markdown("<H2>WanGP - AI Generative Models for the GPU Poor by <B>DeepBeepMeep</B> (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>GitHub</A>)</H2>")
+        gr.Markdown(
+            "<H2>Wan2GP v13.141 by "
+            "<A HREF='https://github.com/deepbeepmeep' TARGET='_blank' REL='noopener noreferrer'>DeepBeepMeep</A>"
+            "<BR>MultiGPU by "
+            "<A HREF='https://github.com/QueenDekim' TARGET='_blank' REL='noopener noreferrer'>QueenDekim</A>"
+            "</H2>"
+        )
+        gr.Markdown(
+            "**[Wan2GP-MultiGPU](https://github.com/QueenDekim/Wan2GP-MultiGPU)** is a GPU-first fork "
+            "of [Wan2GP / WanGP](https://github.com/deepbeepmeep/Wan2GP). "
+            "**DeepBeepMeep** develops the original generative application. "
+            "**QueenDekim** develops and maintains the MultiGPU integration: "
+            "multi-GPU transformer/decoder partitioning, architecture-specific dispatch, "
+            "VRAM-first model and LoRA residency, GPU memory profiles, and compatibility testing. "
+            "Single-GPU operation retains the upstream MMGP workflow."
+        )
         gr.Markdown("Many thanks to:")
         gr.Markdown("- <B>Alibaba Wan Team</B> for the best open source video generators (https://github.com/Wan-Video/Wan2.1, https://github.com/Wan-Video/Wan2.2)")
         gr.Markdown("- <B>Alibaba Vace, Multitalk and Fun Teams</B> for their incredible control net models (https://github.com/ali-vilab/VACE), (https://github.com/MeiGen-AI/MultiTalk) and  (https://huggingface.co/alibaba-pai/Wan2.2-Fun-A14B-InP) ")
