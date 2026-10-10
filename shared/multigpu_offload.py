@@ -38,6 +38,28 @@ class AccelerateMultiGPU:
         if self.verbose >= 1:
             print(f"[MultiGPU] {message}", flush=True)
 
+    def _log_host_commit(self, label):
+        """Track private commit separately from reclaimable working-set pages."""
+        if self.verbose < 2:
+            return
+        try:
+            import psutil
+            proc = psutil.Process(os.getpid())
+            info = proc.memory_info()
+            private = getattr(info, "private", None)
+            if private is None:
+                private = getattr(info, "pagefile", None)
+            if private is None:
+                private = info.vms
+            available = psutil.virtual_memory().available
+            self._log(
+                f"Host memory [{label}]: private_commit={private / 1024**3:.2f} GiB; "
+                f"working_set={info.rss / 1024**3:.2f} GiB; "
+                f"system_available={available / 1024**3:.2f} GiB"
+            )
+        except Exception:
+            pass
+
     @staticmethod
     def _iter_modules_unique(root):
         """Iterate an nn.Module graph once per object, even if cyclic."""
@@ -1692,6 +1714,7 @@ class AccelerateMultiGPU:
         if model_id in self.dispatched:
             return self.dispatched[model_id]
 
+        self._log_host_commit(f"{model_id} before dispatch")
         self._detach_registered_lora_owner_cycles(model_id, model)
         self._detach_registered_module_cycles(model_id, model)
         self._ensure_state_dict_compat(model_id, model)
@@ -1878,6 +1901,7 @@ class AccelerateMultiGPU:
             raise
 
         self.dispatched[model_id] = dispatched
+        self._log_host_commit(f"{model_id} after dispatch")
         return dispatched
 
     def load(self, model_id, blocks_name, preload=False):
@@ -1922,8 +1946,10 @@ class AccelerateMultiGPU:
         if model is None:
             self._mark_inactive(model_id)
             return
+        self._log_host_commit(f"{model_id} before unload")
         self._log(f"{model_id}: stage complete; releasing all dispatched GPU weights")
         self._move_model_to_cpu(model)
+        self._log_host_commit(f"{model_id} after unload")
         self._mark_inactive(model_id, model)
         self.offload.loaded_blocks[model_id] = None
         gc.collect()
