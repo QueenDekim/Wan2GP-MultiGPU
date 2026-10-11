@@ -2525,6 +2525,28 @@ class AccelerateMultiGPU:
             if model_id not in keep_ids:
                 self._restore_mmgp_forwards(model_id)
 
+    def _mmgp_move_args_gpu_first(self, dtype, *args, **kwargs):
+        """MMGP hook input conversion without implicit current-GPU migration.
+
+        Upstream MMGP 3.8.2 uses arg.to(dtype).cuda() for FP32 tensors.
+        Calling .cuda() with no device moves an existing cuda:0 activation
+        to whatever shard ran last (often cuda:1 after text/denoising).
+        Existing CUDA tensors must keep their device. Newly created host
+        tensors are placed explicitly on the primary CUDA GPU.
+        """
+        def converted(value):
+            if not torch.is_tensor(value):
+                return value
+            if dtype is not None and value.dtype == torch.float32:
+                value = value.to(dtype=dtype)
+            if value.device.type == "cpu":
+                value = value.to(device=self.devices[0], non_blocking=True)
+            return value
+
+        return [converted(value) for value in args], {
+            name: converted(value) for name, value in kwargs.items()
+        }
+
     def release(self):
         if not self.installed:
             return
@@ -2537,6 +2559,10 @@ class AccelerateMultiGPU:
                     object.__delattr__(model, "_multigpu_primary_device")
                 except AttributeError:
                     pass
+        # Restore MMGP's own argument placement when leaving MultiGPU mode.
+        original_move = getattr(self, "_original_move_args_to_gpu", None)
+        if original_move is not None:
+            self.offload.move_args_to_gpu = original_move
         self.offload.gpu_load_blocks = self._original_load
         self.offload.gpu_unload_blocks = self._original_unload
         self.offload.unload_all = self._original_unload_all
@@ -2566,6 +2592,17 @@ class AccelerateMultiGPU:
         self._original_unload = self.offload.gpu_unload_blocks
         self._original_unload_all = self.offload.unload_all
         self._original_release = self.offload.release
+        self._original_move_args_to_gpu = getattr(self.offload, "move_args_to_gpu", None)
+
+        # MMGP's hook_change_module may still be used for submodules whose
+        # forward was not replaced by Accelerate. Patch the host-to-GPU input
+        # helper *on this manager instance*, avoiding a global monkeypatch.
+        if callable(self._original_move_args_to_gpu):
+            self.offload.move_args_to_gpu = types.MethodType(
+                lambda obj, dtype, *args, **kwargs:
+                    self._mmgp_move_args_gpu_first(dtype, *args, **kwargs),
+                self.offload,
+            )
 
         self.offload.gpu_load_blocks = types.MethodType(
             lambda obj, model_id, blocks_name, preload=False, *a, **kw:
