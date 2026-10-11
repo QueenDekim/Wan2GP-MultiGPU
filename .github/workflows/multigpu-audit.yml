@@ -10,6 +10,7 @@ on:
       - 'postprocessing/**'
       - 'scripts/audit_multigpu.py'
       - 'scripts/multigpu_smoke.py'
+      - 'scripts/test_minimax_dialogue_planning.py'
       - 'wgp.py'
       - 'README.md'
       - 'plugins/about/plugin.py'
@@ -40,8 +41,12 @@ jobs:
             models/TTS/chatterbox/pipeline.py \
             models/minimax_h3/transformer.py \
             models/minimax_h3/audio_vae.py \
+            models/minimax_h3/dialogue.py \
             plugins/about/plugin.py \
-            scripts/multigpu_smoke.py
+            scripts/multigpu_smoke.py \
+            scripts/test_minimax_dialogue_planning.py
+      - name: Check multilingual MiniMax H3 dialogue duration planning
+        run: python scripts/test_minimax_dialogue_planning.py
       - name: Verify README and UI project attribution
         run: |
           python - <<'PY'
