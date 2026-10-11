@@ -125,12 +125,20 @@ def check_gguf_direct_cuda_transfer(manager):
     parameter.tensor_shape = source.tensor_shape
     owner = nn.Module()
     owner.register_parameter("packed_weight", parameter)
+    bias = GGUFSourceTensor.wrap(
+        torch.arange(32, dtype=torch.uint8),
+        tensor_type="SMOKE_BIAS", tensor_shape=(32,),
+    )
+    bias._gguf_bias_orig_dtype = torch.float16
+    bias._gguf_bias_orig_tensor_type = "SMOKE_BIAS_SOURCE"
+    owner.register_buffer("packed_bias", bias)
 
     manager._patch_accelerate_quanto()
     count = manager._preplace_direct_device_map_tensors(
-        owner, {"packed_weight": manager.devices[1]},
+        owner,
+        {"packed_weight": manager.devices[1], "packed_bias": manager.devices[0]},
     )
-    assert count == 1
+    assert count == 2
     moved = owner.packed_weight
     assert isinstance(moved, GGUFSourceTensor)
     assert moved.device == manager.devices[1]
@@ -138,7 +146,15 @@ def check_gguf_direct_cuda_transfer(manager):
     assert moved.tensor_type == "SMOKE_Q4"
     assert tuple(moved.tensor_shape) == (16, 32)
     torch.testing.assert_close(moved.cpu().as_subclass(torch.Tensor), packed_bytes)
-    print("[MultiGPU smoke] LTX2 GGUFSourceTensor direct CUDA preplacement: OK")
+    assert "packed_bias" in owner._buffers
+    assert "packed_bias" not in owner._parameters
+    moved_bias = owner.packed_bias
+    assert isinstance(moved_bias, GGUFSourceTensor)
+    assert moved_bias.device == manager.devices[0]
+    assert moved_bias.tensor_type == "SMOKE_BIAS"
+    assert moved_bias._gguf_bias_orig_dtype == torch.float16
+    assert moved_bias._gguf_bias_orig_tensor_type == "SMOKE_BIAS_SOURCE"
+    print("[MultiGPU smoke] LTX2 GGUFSourceTensor parameter/buffer CUDA preplacement: OK")
 
 def check_nested_mmgp_restore(manager):
     """Ensure unload restores all MMGP child block tensors, not just root."""
