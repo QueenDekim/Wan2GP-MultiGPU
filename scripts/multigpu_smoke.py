@@ -279,9 +279,25 @@ def check_minimax_h3_text_conditioning():
             self.condition_proj = nn.Linear(8, 12).to("cuda:0")
             self.token_refiner = Refiner().to("cuda:0")
             self._interrupt = False
-            self._multigpu_primary_device = torch.device("cuda:0")
 
     harness = Harness()
+    # Model preprocessing occurs before its first MMGP GPU load/dispatch.
+    # Mimic the actual lifecycle rather than injecting the marker directly:
+    # this caught the dialogue failure missed by the old smoke test.
+    fake_offload = SimpleNamespace(
+        models={"transformer": harness},
+        gpu_load_blocks=lambda *args, **kwargs: None,
+        gpu_unload_blocks=lambda *args, **kwargs: None,
+        unload_all=lambda *args, **kwargs: None,
+        release=lambda *args, **kwargs: None,
+    )
+    stage_manager = AccelerateMultiGPU(
+        fake_offload, ["cuda:0", "cuda:1"], verbose=0,
+    )
+    assert not hasattr(harness, "_multigpu_primary_device")
+    stage_manager.install()
+    assert harness._multigpu_primary_device == torch.device("cuda:0")
+    assert "transformer" not in stage_manager.dispatched
     text_states = torch.randn(1, 5, 8, device="cuda:1")
     with torch.inference_mode():
         expected = harness.token_refiner(
@@ -313,7 +329,9 @@ def check_minimax_h3_text_conditioning():
         assert passthrough.device == torch.device("cuda:0")
         torch.testing.assert_close(passthrough, cached.to("cuda:0"), rtol=0, atol=0)
 
-    print("[MultiGPU smoke] MiniMax H3 GPU1 Qwen embeddings -> GPU0 refiner: OK")
+    stage_manager.release()
+    assert not hasattr(harness, "_multigpu_primary_device")
+    print("[MultiGPU smoke] MiniMax H3 GPU1 Qwen embeddings -> GPU0 refiner before dispatch: OK")
 
 
 def check_gemma_vram_budget(manager):
