@@ -161,7 +161,17 @@ def check_ltx2_tiled_vae_device_switch():
     assert actual.device == video.device
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-    print("[MultiGPU smoke] LTX2 tiled VAE cross-GPU accumulation: OK")
+
+    # One-frame and disabled-tiling conditioning may take the direct encoder
+    # route. The input is on cuda:0 even when the encoder returns on cuda:1.
+    direct_vae = SwitchingVAE(alternate=True)
+    direct_vae.calls = 1
+    with torch.inference_mode():
+        direct = encode_video(video, direct_vae, None)
+    assert direct.device == video.device
+    assert direct.shape == expected.shape
+    torch.testing.assert_close(direct, expected, rtol=1e-5, atol=1e-5)
+    print("[MultiGPU smoke] LTX2 tiled and direct VAE cross-GPU conditioning: OK")
 
 
 def check_gguf_direct_cuda_transfer(manager):
