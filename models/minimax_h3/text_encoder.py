@@ -155,6 +155,13 @@ class MiniMaxH3TextEncoder(nn.Module):
         return entries or [TEXT_PAD]
 
     def encode(self, prompt, items, device, dtype):
+        # Qwen's embedding table belongs to the primary device. A second
+        # dialogue turn can begin while cuda:1 is the thread's current device
+        # after the prior decoder shard. Route indices, rotary positions and
+        # visual masks explicitly to cuda:0 before MMGP lazily dispatches
+        # embed_tokens; a CPU/mmap-backed weight.device is not authoritative.
+        primary = getattr(self.language_model, "_multigpu_primary_device", None)
+        device = torch.device(primary if primary is not None else device)
         entries = self._presentation(prompt, items)
         token_ids = []
         visual_specs = []
