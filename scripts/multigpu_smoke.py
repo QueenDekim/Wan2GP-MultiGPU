@@ -108,6 +108,38 @@ class GemmaLike(nn.Module):
         return self.lm_head(self.model.norm(hidden))
 
 
+def check_gguf_direct_cuda_transfer(manager):
+    """Exercise LTX2 GGUFSourceTensor root-parameter preplacement on CUDA."""
+    from shared.qtypes.gguf import GGUFSourceTensor
+
+    # GGUFSourceTensor carries packed storage and a logical tensor shape.
+    # No real checkpoint or dequantization is required for a device test.
+    packed_bytes = torch.arange(128, dtype=torch.uint8)
+    source = GGUFSourceTensor.wrap(
+        packed_bytes, tensor_type="SMOKE_Q4", tensor_shape=(16, 32),
+    )
+    parameter = nn.Parameter(source, requires_grad=False)
+    # nn.Parameter construction drops arbitrary tensor subclass attributes;
+    # real GGUF loading stores them on the registered parameter.
+    parameter.tensor_type = source.tensor_type
+    parameter.tensor_shape = source.tensor_shape
+    owner = nn.Module()
+    owner.register_parameter("packed_weight", parameter)
+
+    manager._patch_accelerate_quanto()
+    count = manager._preplace_direct_device_map_tensors(
+        owner, {"packed_weight": manager.devices[1]},
+    )
+    assert count == 1
+    moved = owner.packed_weight
+    assert isinstance(moved, GGUFSourceTensor)
+    assert moved.device == manager.devices[1]
+    assert moved.dtype == torch.uint8
+    assert moved.tensor_type == "SMOKE_Q4"
+    assert tuple(moved.tensor_shape) == (16, 32)
+    torch.testing.assert_close(moved.cpu().as_subclass(torch.Tensor), packed_bytes)
+    print("[MultiGPU smoke] LTX2 GGUFSourceTensor direct CUDA preplacement: OK")
+
 def check_nested_mmgp_restore(manager):
     """Ensure unload restores all MMGP child block tensors, not just root."""
     backing = GemmaLike(features=32, count=4).eval()
@@ -275,6 +307,7 @@ def main() -> int:
         check_root_qwen_decoder(manager)
         check_gemma_vram_budget(manager)
         check_nested_mmgp_restore(manager)
+        check_gguf_direct_cuda_transfer(manager)
 
     print("[MultiGPU smoke] PASS")
     return 0
