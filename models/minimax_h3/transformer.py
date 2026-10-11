@@ -641,6 +641,20 @@ class MiniMaxH3Model(nn.Module):
             module._lock_dtype = torch.float32
 
     def preprocess_text_embeds(self, text_states):
+        # Qwen3-VL may return its final hidden states on the *last* GPU.
+        # MiniMax H3's condition_proj/token_refiner are support modules on the
+        # *primary* GPU. This method executes outside transformer.forward(),
+        # so Accelerate cannot move the input through its root forward hook.
+        # Consult the MultiGPU execution device even when MMGP has already
+        # restored the projection weight to CPU/mmap backing.
+        target = getattr(self, "_multigpu_primary_device", None)
+        if target is None:
+            weight_device = self.condition_proj.weight.device
+            target = weight_device if weight_device.type != "cpu" else text_states.device
+        target = torch.device(target)
+        if text_states.device != target:
+            text_states = text_states.to(device=target, non_blocking=True)
+
         if text_states.shape[-1] == self.hidden_size:
             return text_states
         self.token_refiner._interrupt = self._interrupt
