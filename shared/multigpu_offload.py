@@ -2529,6 +2529,14 @@ class AccelerateMultiGPU:
         if not self.installed:
             return
         self.unload_all()
+        # Do not leave stale MultiGPU device routing on modules once MMGP
+        # returns to its original single-GPU lifecycle.
+        for model in getattr(self.offload, "models", {}).values():
+            if getattr(model, "_multigpu_primary_device", None) == self.devices[0]:
+                try:
+                    object.__delattr__(model, "_multigpu_primary_device")
+                except AttributeError:
+                    pass
         self.offload.gpu_load_blocks = self._original_load
         self.offload.gpu_unload_blocks = self._original_unload
         self.offload.unload_all = self._original_unload_all
@@ -2544,6 +2552,15 @@ class AccelerateMultiGPU:
             raise ValueError("MultiGPU requires at least two CUDA devices")
         if self.installed:
             return self
+
+        # Model-specific preprocessing (MiniMax H3 condition_proj, etc.)
+        # may execute BEFORE the model's first forward and therefore BEFORE
+        # our _dispatch() sets device routing. Install the primary CUDA device
+        # on every MMGP-registered root model immediately; never infer it from
+        # CPU/mmap-backed weights or Qwen3-VL's last (secondary-GPU) layer.
+        for model in getattr(self.offload, "models", {}).values():
+            if isinstance(model, torch.nn.Module):
+                object.__setattr__(model, "_multigpu_primary_device", self.devices[0])
 
         self._original_load = self.offload.gpu_load_blocks
         self._original_unload = self.offload.gpu_unload_blocks
