@@ -264,6 +264,60 @@ def check_nested_mmgp_restore(manager):
     del manager.offload.models["nested_restore"]
     del manager.offload.blocks_of_modules
 
+def check_minimax_h3_audio_vae_cross_gpu():
+    """MiniMax H3 decoder/encoder accepts final-shard audio on cuda:1.
+
+    The real Audio VAE is large, so test its *actual WanGP encode/decode
+    boundary methods* with a small CUDA Conv1d instead of loading checkpoints.
+    The base encode/decode are mocked, not the boundary under test.
+    """
+    from unittest.mock import patch
+    from models.minimax_h3.audio_vae import MiniMaxH3AudioVAE
+    from models.minimax_h3.components.audio_autoencoder import AutoencoderKLMiniMaxH3Audio
+
+    vae = MiniMaxH3AudioVAE.__new__(MiniMaxH3AudioVAE)
+    nn.Module.__init__(vae)
+    vae.dec_in_proj = nn.Conv1d(4, 1, kernel_size=1).to("cuda:0")
+    vae.register_buffer("_latents_mean", torch.zeros(4))
+    vae.register_buffer("_latents_std", torch.ones(4))
+    object.__setattr__(vae, "_multigpu_primary_device", torch.device("cuda:0"))
+
+    def fake_decode(self, input_latents, return_dict=False):
+        assert input_latents.device == torch.device("cuda:0")
+        assert input_latents.dtype == torch.float32
+        return (self.dec_in_proj(input_latents),)
+
+    def fake_encode(self, waveform, return_dict=False):
+        assert waveform.device == torch.device("cuda:0")
+        assert waveform.shape[1] == 1
+        posterior = SimpleNamespace(
+            mode=lambda: waveform.expand(-1, 4, -1).contiguous()
+        )
+        return (posterior,)
+
+    with torch.inference_mode():
+        incoming_latents = torch.randn(1, 4, 2, 7, device="cuda:1")
+        incoming_audio = torch.randn(1, 2, 56, device="cuda:1")
+        with patch.object(AutoencoderKLMiniMaxH3Audio, "decode", fake_decode):
+            wave = vae.decode(incoming_latents)
+        assert wave.device == torch.device("cuda:0")
+        assert wave.shape == (1, 2, 7)
+        with patch.object(AutoencoderKLMiniMaxH3Audio, "encode", fake_encode):
+            encoded = vae.encode(incoming_audio)
+        assert encoded.device == torch.device("cuda:0")
+        assert encoded.shape == (1, 4, 2, 56)
+
+        # Existing single-GPU use should still select the CUDA weights, even
+        # when the MultiGPU-specific property is unavailable.
+        object.__delattr__(vae, "_multigpu_primary_device")
+        with patch.object(AutoencoderKLMiniMaxH3Audio, "decode", fake_decode):
+            wave_single = vae.decode(incoming_latents)
+        assert wave_single.device == torch.device("cuda:0")
+        torch.testing.assert_close(wave_single, wave)
+
+    print("[MultiGPU smoke] MiniMax H3 audio VAE GPU1 -> GPU0 decode/encode: OK")
+
+
 def check_minimax_h3_text_conditioning():
     """Verify Qwen3-VL GPU1 embeddings enter H3 GPU0 projection safely."""
     from models.minimax_h3.transformer import MiniMaxH3Model
@@ -463,6 +517,7 @@ def main() -> int:
         check_gguf_direct_cuda_transfer(manager)
         check_ltx2_tiled_vae_device_switch()
         check_minimax_h3_text_conditioning()
+        check_minimax_h3_audio_vae_cross_gpu()
 
     print("[MultiGPU smoke] PASS")
     return 0
