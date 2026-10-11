@@ -1036,7 +1036,12 @@ class AccelerateMultiGPU:
         except Exception:
             ScaledFP8WeightTensor = ()
 
-        if QuantoQTensor == () and WeightQBytesTensor == () and ScaledFP8WeightTensor == ():
+        try:
+            from shared.qtypes.gguf import GGUFSourceTensor
+        except ImportError:
+            GGUFSourceTensor = ()
+
+        if all(cls == () for cls in (QuantoQTensor, WeightQBytesTensor, ScaledFP8WeightTensor, GGUFSourceTensor)):
             return
 
         import accelerate.hooks as accelerate_hooks
@@ -1102,7 +1107,10 @@ class AccelerateMultiGPU:
 
             old_value = getattr(module, tensor_name)
             special_types = tuple(
-                cls for cls in (QuantoQTensor, WeightQBytesTensor, ScaledFP8WeightTensor)
+                cls for cls in (
+                    QuantoQTensor, WeightQBytesTensor, ScaledFP8WeightTensor,
+                    GGUFSourceTensor,
+                )
                 if isinstance(cls, type)
             )
             if special_types and isinstance(old_value, special_types):
@@ -1130,10 +1138,12 @@ class AccelerateMultiGPU:
                 else:
                     new_value = source.to(target, non_blocking=non_blocking)
 
-                # Do not reconstruct custom QTensor subclasses through
-                # param_cls(new_value): ScaledFP8WeightTensor and Quanto
-                # wrappers have metadata-rich constructors. Their .to()
-                # implementations preserve the wrapper and quantization data.
+                # Bypass Accelerate's param_cls(new_value, requires_grad=...):
+                # GGUFSourceTensor inherits Tensor.new(), whose constructor
+                # cannot accept that signature. Its .to() retains packed
+                # GGUF bytes, tensor_type and tensor_shape on the target GPU.
+                # Quanto/FP8 wrappers also require preserving their metadata
+                # rather than rebuilding a regular nn.Parameter.
                 module._parameters[tensor_name] = new_value
                 if target.type == "cuda":
                     maybe_trim_dispatch_working_set(target)
@@ -1161,7 +1171,7 @@ class AccelerateMultiGPU:
             pass
 
         accelerate_hooks._wgp_quanto_patch = True
-        self._log("Accelerate quantized-tensor compatibility enabled (Quanto/Wan2GP custom QTensor)")
+        self._log("Accelerate quantized-tensor compatibility enabled (Quanto/GGUF/Wan2GP custom QTensor)")
 
 
     def _gemma_device_map(self, model):
