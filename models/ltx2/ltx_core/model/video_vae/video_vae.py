@@ -1300,15 +1300,35 @@ def encode_video(
             encoded_tile = encoded_tile[:, :, :t_len, :h_len, :w_len]
 
             if output is None:
+                # Accumulate on the input CUDA device. In WanGP MultiGPU,
+                # MMGP/Accelerate may move the VAE execution context between
+                # tiles, but the assembled latent must stay on one device.
+                # For a CPU input, use the encoder's output device instead so
+                # host RAM is not used for latent accumulation.
+                accumulation_device = (
+                    video.device if video.device.type == "cuda"
+                    else encoded_tile.device
+                )
                 output = torch.zeros(
                     latent_shape.to_torch_shape(),
-                    device=encoded_tile.device,
+                    device=accumulation_device,
                     dtype=encoded_tile.dtype,
                 )
                 weights = torch.zeros(
                     (1, 1, latent_shape.frames, latent_shape.height, latent_shape.width),
-                    device=encoded_tile.device,
+                    device=accumulation_device,
                     dtype=encoded_tile.dtype,
+                )
+
+            # Only a small encoded tile (not a pixel video or VAE weights)
+            # crosses GPUs when the encoder returns a different CUDA device.
+            # Every accumulator update and blending mask stays on the same
+            # CUDA device, including subsequent tiles after an MMGP switch.
+            if encoded_tile.device != output.device or encoded_tile.dtype != output.dtype:
+                encoded_tile = encoded_tile.to(
+                    device=output.device,
+                    dtype=output.dtype,
+                    non_blocking=True,
                 )
 
             mask_t = _make_mask_1d(
@@ -1316,24 +1336,24 @@ def encode_video(
                 t_left,
                 t_right,
                 left_starts_from_0=True,
-                device=encoded_tile.device,
-                dtype=encoded_tile.dtype,
+                device=output.device,
+                dtype=output.dtype,
             )
             mask_h = _make_mask_1d(
                 h_len,
                 h_left,
                 h_right,
                 left_starts_from_0=False,
-                device=encoded_tile.device,
-                dtype=encoded_tile.dtype,
+                device=output.device,
+                dtype=output.dtype,
             )
             mask_w = _make_mask_1d(
                 w_len,
                 w_left,
                 w_right,
                 left_starts_from_0=False,
-                device=encoded_tile.device,
-                dtype=encoded_tile.dtype,
+                device=output.device,
+                dtype=output.dtype,
             )
             mask = mask_t[:, None, None] * mask_h[None, :, None] * mask_w[None, None, :]
             mask = mask.unsqueeze(0).unsqueeze(0)
