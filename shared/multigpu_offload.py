@@ -1144,7 +1144,22 @@ class AccelerateMultiGPU:
                 # GGUF bytes, tensor_type and tensor_shape on the target GPU.
                 # Quanto/FP8 wrappers also require preserving their metadata
                 # rather than rebuilding a regular nn.Parameter.
-                module._parameters[tensor_name] = new_value
+                if isinstance(GGUFSourceTensor, type) and isinstance(source, GGUFSourceTensor):
+                    # Bias metadata is required to interpret raw GGUF values
+                    # correctly after device movement; .to() already retains
+                    # tensor_type and tensor_shape.
+                    for attr in ("_gguf_bias_orig_dtype", "_gguf_bias_orig_tensor_type"):
+                        if hasattr(source, attr):
+                            setattr(new_value, attr, getattr(source, attr))
+                # Custom quantized classes may be registered as nn.Parameter
+                # *or* as buffers. Do not accidentally move a buffer to the
+                # parameter registry when bypassing Accelerate reconstruction.
+                registry = (
+                    module._buffers
+                    if tensor_name in module._buffers
+                    else module._parameters
+                )
+                registry[tensor_name] = new_value
                 if target.type == "cuda":
                     maybe_trim_dispatch_working_set(target)
                     if clear_cache:
