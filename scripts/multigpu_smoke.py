@@ -384,6 +384,82 @@ def check_minimax_h3_audio_vae_cross_gpu():
     print("[MultiGPU smoke] MiniMax H3 audio VAE active cuda:1 -> cuda:0 decode/encode: OK")
 
 
+def check_minimax_h3_repeated_qwen_segments():
+    """Qwen token indices stay on GPU0 after a previous shard leaves GPU1 active.
+
+    The old H3 pipeline.device returned bare torch.device("cuda"). After
+    segment 1, that alias resolved to cuda:1 and MMGP's embed_tokens, pinned
+    to cuda:0, failed torch.index_select on the next segment.
+    """
+    from models.minimax_h3.pipeline import MiniMaxH3Pipeline
+    from models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
+
+    class SmallQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(64, 8).to("cuda:0")
+            self.layers = nn.ModuleList([])
+            self.input_devices = []
+
+        def forward(self, *, inputs_embeds, position_ids=None,
+                    visual_pos_masks=None, deepstack_visual_embeds=None,
+                    use_cache=False):
+            assert inputs_embeds.device == torch.device("cuda:0")
+            return SimpleNamespace(last_hidden_state=inputs_embeds)
+
+    language_model = SmallQwen()
+    def check_embedding_device(_module, args):
+        language_model.input_devices.append(args[0].device)
+        assert args[0].device == torch.device("cuda:0")
+    handle = language_model.embed_tokens.register_forward_pre_hook(check_embedding_device)
+
+    encoder = MiniMaxH3TextEncoder.__new__(MiniMaxH3TextEncoder)
+    nn.Module.__init__(encoder)
+    encoder.language_model = language_model
+    encoder._token_ids = lambda _text: [1, 2, 3, 4]
+    transformer = nn.Linear(8, 8).to("cuda:0")
+    fake_offload = SimpleNamespace(
+        models={"text_encoder": language_model, "transformer": transformer},
+        gpu_load_blocks=lambda *a, **k: None,
+        gpu_unload_blocks=lambda *a, **k: None,
+        unload_all=lambda *a, **k: None,
+        release=lambda *a, **k: None,
+    )
+    manager = AccelerateMultiGPU(fake_offload, ["cuda:0", "cuda:1"], verbose=0)
+    manager.install()
+    try:
+        pipeline = SimpleNamespace(transformer=transformer)
+        with torch.inference_mode():
+            with torch.cuda.device("cuda:0"):
+                first_device = MiniMaxH3Pipeline.device.fget(pipeline)
+                first, first_tags = encoder.encode(
+                    "first segment", [], first_device, torch.float32,
+                )
+                assert first.device == torch.device("cuda:0")
+                assert first_tags.device == torch.device("cuda:0")
+
+            # A previous Qwen/Transformer shard has run on cuda:1.
+            with torch.cuda.device("cuda:1"):
+                assert torch.cuda.current_device() == 1
+                second_device = MiniMaxH3Pipeline.device.fget(pipeline)
+                assert second_device == torch.device("cuda:0")
+                second, second_tags = encoder.encode(
+                    "second segment", [], torch.device("cuda"), torch.float32,
+                )
+                assert torch.cuda.current_device() == 1
+                assert second.device == torch.device("cuda:0")
+                assert second_tags.device == torch.device("cuda:0")
+                torch.testing.assert_close(first, second)
+
+        assert language_model.input_devices == [
+            torch.device("cuda:0"), torch.device("cuda:0"),
+        ]
+    finally:
+        handle.remove()
+        manager.release()
+    print("[MultiGPU smoke] MiniMax H3 repeated Qwen segments preserve cuda:0 embeddings: OK")
+
+
 def check_minimax_h3_text_conditioning():
     """Verify Qwen3-VL GPU1 embeddings enter H3 GPU0 projection safely."""
     from models.minimax_h3.transformer import MiniMaxH3Model
@@ -583,6 +659,7 @@ def main() -> int:
         check_gguf_direct_cuda_transfer(manager)
         check_ltx2_tiled_vae_device_switch()
         check_minimax_h3_text_conditioning()
+        check_minimax_h3_repeated_qwen_segments()
         check_minimax_h3_audio_vae_cross_gpu()
         check_mmgp_implicit_cuda_conversion()
 
