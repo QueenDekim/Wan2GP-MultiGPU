@@ -264,6 +264,58 @@ def check_nested_mmgp_restore(manager):
     del manager.offload.models["nested_restore"]
     del manager.offload.blocks_of_modules
 
+def check_minimax_h3_text_conditioning():
+    """Verify Qwen3-VL GPU1 embeddings enter H3 GPU0 projection safely."""
+    from models.minimax_h3.transformer import MiniMaxH3Model
+
+    class Refiner(nn.Module):
+        def forward(self, chunks):
+            return torch.tanh(chunks[0])
+
+    class Harness(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = 12
+            self.condition_proj = nn.Linear(8, 12).to("cuda:0")
+            self.token_refiner = Refiner().to("cuda:0")
+            self._interrupt = False
+            self._multigpu_primary_device = torch.device("cuda:0")
+
+    harness = Harness()
+    text_states = torch.randn(1, 5, 8, device="cuda:1")
+    with torch.inference_mode():
+        expected = harness.token_refiner(
+            [harness.condition_proj(text_states.to("cuda:0")[0])]
+        ).unsqueeze(0)
+        actual = MiniMaxH3Model.preprocess_text_embeds(harness, text_states)
+        assert actual.device == torch.device("cuda:0")
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+        # The projection may still be CPU/mmap-backed after the preceding
+        # MMGP stage was unloaded. It loads lazily on the first forward, so
+        # weight.device cannot be used to decide where input embeddings go.
+        cpu_proj = nn.Linear(8, 12)
+        cpu_proj.load_state_dict(harness.condition_proj.cpu().state_dict())
+        harness.condition_proj = cpu_proj
+        def lazy_gpu_load(module, _args):
+            module.to("cuda:0")
+        hook = harness.condition_proj.register_forward_pre_hook(lazy_gpu_load)
+        try:
+            lazy_result = MiniMaxH3Model.preprocess_text_embeds(harness, text_states)
+        finally:
+            hook.remove()
+        assert lazy_result.device == torch.device("cuda:0")
+        torch.testing.assert_close(lazy_result, expected, rtol=1e-5, atol=1e-5)
+
+        # Cached/preprocessed 12-wide embeddings must also be on cuda:0.
+        cached = torch.randn(1, 5, 12, device="cuda:1")
+        passthrough = MiniMaxH3Model.preprocess_text_embeds(harness, cached)
+        assert passthrough.device == torch.device("cuda:0")
+        torch.testing.assert_close(passthrough, cached.to("cuda:0"), rtol=0, atol=0)
+
+    print("[MultiGPU smoke] MiniMax H3 GPU1 Qwen embeddings -> GPU0 refiner: OK")
+
+
 def check_gemma_vram_budget(manager):
     """Catch the 0 GiB secondary-GPU / tied embedding OOM regression."""
     from unittest.mock import patch
@@ -392,6 +444,7 @@ def main() -> int:
         check_nested_mmgp_restore(manager)
         check_gguf_direct_cuda_transfer(manager)
         check_ltx2_tiled_vae_device_switch()
+        check_minimax_h3_text_conditioning()
 
     print("[MultiGPU smoke] PASS")
     return 0
