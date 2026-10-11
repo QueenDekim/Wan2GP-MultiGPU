@@ -145,10 +145,38 @@ def parse_dialogue_prompt(prompt: str) -> list[DialogueTurn]:
     return turns
 
 
+def _estimated_speech_seconds(text: str) -> float:
+    words = len(_normalize_words(text))
+    punctuation = len(re.findall(r"[.!?;:。！？]", text)) * 0.18
+    return words / H3_DIALOGUE_WORDS_PER_SECOND + punctuation + 1.4
+
+
 def _natural_duration(turn: DialogueTurn) -> float:
-    words = len(_normalize_words(turn.text))
-    punctuation = len(re.findall(r"[.!?;:]", turn.text)) * 0.18
-    return max(H3_DIALOGUE_MIN_SEGMENT_SECONDS, min(H3_DIALOGUE_MAX_SEGMENT_SECONDS, words / H3_DIALOGUE_WORDS_PER_SECOND + punctuation + 1.4))
+    return max(H3_DIALOGUE_MIN_SEGMENT_SECONDS,
+               min(H3_DIALOGUE_MAX_SEGMENT_SECONDS, _estimated_speech_seconds(turn.text)))
+
+
+def _split_long_turn(turn: DialogueTurn) -> list[DialogueTurn]:
+    """Split a long monologue into sequential turns without dropping words.
+
+    H3 synthesizes at most 45 seconds in a segment. Previously a single
+    Speaker 1 block longer than that was silently limited to 45 seconds even
+    if the overall audio duration cap was 120 or 300 seconds. Each chunk
+    retains speaker, language, delivery instructions and voice reference.
+    """
+    if _estimated_speech_seconds(turn.text) <= H3_DIALOGUE_MAX_SEGMENT_SECONDS:
+        return [turn]
+    chunks, current = [], []
+    for word in turn.text.split():
+        candidate = " ".join((*current, word))
+        if current and _estimated_speech_seconds(candidate) > H3_DIALOGUE_MAX_SEGMENT_SECONDS:
+            chunks.append(replace(turn, text=" ".join(current)))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        chunks.append(replace(turn, text=" ".join(current)))
+    return chunks
 
 
 def plan_dialogue(prompt: str, seed: int, duration_seconds: float | None) -> list[DialogueTurn]:
@@ -158,17 +186,21 @@ def plan_dialogue(prompt: str, seed: int, duration_seconds: float | None) -> lis
     base_seed = random.randrange(0, 2**31) if seed is None or int(seed) < 0 else int(seed)
     duration_limit = min(float(duration_seconds or 0.0), H3_DIALOGUE_MAX_TOTAL_SECONDS)
     planned, elapsed = [], 0.0
-    for index, turn in enumerate(turns):
-        pause = H3_DIALOGUE_PAUSE_SECONDS if planned else 0.0
-        remaining = duration_limit - elapsed - pause
-        if duration_limit > 0 and remaining < H3_DIALOGUE_MIN_SEGMENT_SECONDS:
-            break
-        duration = _natural_duration(turn)
-        if duration_limit > 0:
-            duration = min(duration, remaining)
-        duration = round(duration, 2)
-        planned.append(replace(turn, duration_s=duration, seed=(base_seed + index * 1000) % (2**31)))
-        elapsed += pause + duration
+    for turn in turns:
+        for segment in _split_long_turn(turn):
+            pause = H3_DIALOGUE_PAUSE_SECONDS if planned else 0.0
+            remaining = duration_limit - elapsed - pause
+            if duration_limit > 0 and remaining < H3_DIALOGUE_MIN_SEGMENT_SECONDS:
+                return planned
+            duration = _natural_duration(segment)
+            if duration_limit > 0:
+                duration = min(duration, remaining)
+            duration = round(duration, 2)
+            planned.append(replace(
+                segment, duration_s=duration,
+                seed=(base_seed + len(planned) * 1000) % (2**31),
+            ))
+            elapsed += pause + duration
     return planned
 
 
@@ -218,8 +250,13 @@ def load_dialogue_whisper() -> torch.nn.Module:
 
 
 def _normalize_words(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode().casefold()
-    return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", normalized)
+    # The old ASCII transliteration discarded *every Cyrillic word* (as well
+    # as Arabic, CJK, etc.). As a result a long Russian monologue was planned
+    # as a zero-word, 4-second turn. Keep Unicode letters/digits and normalize
+    # apostrophes without losing the source language; Whisper uses this same
+    # tokenizer for speech alignment.
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return re.findall(r"[^\W_]+(?:['’][^\W_]+)?", normalized, flags=re.UNICODE)
 
 
 def _fuzzy_match(left: str, right: str) -> bool:
@@ -373,6 +410,12 @@ def generate_dialogue(pipeline, input_prompt: str, *, audio_guide=None, audio_gu
     references = {speaker: _VoiceReference(waveform=waveform[0].detach().to(device="cpu", non_blocking=False), sample_rate=H3_DIALOGUE_AUDIO_SAMPLE_RATE)
                   for speaker, waveform in zip(reference_speakers, reference_waveforms)}
     duration_limit = min(float(duration_seconds or 0.0), H3_DIALOGUE_MAX_TOTAL_SECONDS)
+    planned_duration = sum(turn.duration_s for turn in turns) + H3_DIALOGUE_PAUSE_SECONDS * max(0, len(turns) - 1)
+    print(
+        f"[MiniMax H3 Dialogue] Planned {len(turns)} turn(s), "
+        f"{planned_duration:.1f}s estimated speech; maximum total audio={duration_limit:g}s",
+        flush=True,
+    )
     generated, generated_duration = [], 0.0
     for index, turn in enumerate(turns):
         pipeline._check_abort()
