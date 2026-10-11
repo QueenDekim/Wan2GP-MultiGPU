@@ -1243,11 +1243,20 @@ def encode_video(
     Returns:
         Encoded latent tensor [b, c_l, f_l, h_l, w_l].
     """
+    def _on_input_cuda_device(encoded: torch.Tensor) -> torch.Tensor:
+        # Conditioning inputs already live on the pipeline's CUDA device.
+        # An MMGP/Accelerate VAE stage may emit latents on another CUDA GPU;
+        # bring only the encoded latent back, never route via system RAM.
+        # Keep the encoder output on GPU when the input was CPU-backed.
+        if video.device.type == "cuda" and encoded.device != video.device:
+            return encoded.to(device=video.device, non_blocking=True)
+        return encoded
+
     if tiling_config is None or (
         tiling_config.spatial_config is None and tiling_config.temporal_config is None
     ):
         with vae_encoding_progress(1, video_encoder, enabled=video.shape[2] > 1):
-            return video_encoder(video)
+            return _on_input_cuda_device(video_encoder(video))
     if video.shape[2] == 1 and tiling_config.spatial_config is not None:
         tiling_config = replace(tiling_config, spatial_config=None)
 
@@ -1363,7 +1372,7 @@ def encode_video(
 
     if output is None or weights is None:
         with vae_encoding_progress(1, video_encoder, enabled=video.shape[2] > 1):
-            return video_encoder(video)
+            return _on_input_cuda_device(video_encoder(video))
     weights = weights.clamp_min(1e-6)
     return output / weights
 
