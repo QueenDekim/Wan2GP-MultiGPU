@@ -264,6 +264,62 @@ def check_nested_mmgp_restore(manager):
     del manager.offload.models["nested_restore"]
     del manager.offload.blocks_of_modules
 
+def check_mmgp_implicit_cuda_conversion():
+    """MMGP's legacy .cuda() cannot migrate GPU0 inputs to active GPU1."""
+    class MmgpStub:
+        def __init__(self):
+            self.models = {}
+            self.gpu_load_blocks = lambda *a, **k: None
+            self.gpu_unload_blocks = lambda *a, **k: None
+            self.unload_all = lambda *a, **k: None
+            self.release = lambda *a, **k: None
+
+        def move_args_to_gpu(self, dtype, *args, **kwargs):
+            def legacy(value):
+                if torch.is_tensor(value):
+                    if value.dtype == torch.float32:
+                        return value.to(dtype).cuda(non_blocking=True)
+                    if not value.is_cuda:
+                        return value.cuda(non_blocking=True)
+                return value
+            return [legacy(value) for value in args], {
+                key: legacy(value) for key, value in kwargs.items()
+            }
+
+    offload = MmgpStub()
+    original = offload.move_args_to_gpu
+    manager = AccelerateMultiGPU(offload, ["cuda:0", "cuda:1"], verbose=0)
+    manager.install()
+    try:
+        conv = nn.Conv1d(4, 4, 1).to("cuda:0")
+        original_forward = conv.forward
+
+        def mmgp_wrapped_forward(*args, **kwargs):
+            args, kwargs = offload.move_args_to_gpu(torch.float32, *args, **kwargs)
+            return original_forward(*args, **kwargs)
+
+        conv.forward = mmgp_wrapped_forward
+        with torch.cuda.device("cuda:1"), torch.inference_mode():
+            input_gpu0 = torch.randn(1, 4, 8, device="cuda:0")
+            input_gpu1 = torch.randn(1, 4, 8, device="cuda:1")
+            input_cpu = torch.randn(1, 4, 8)
+            result = conv(input_gpu0)
+            assert result.device == torch.device("cuda:0")
+            converted, kw = offload.move_args_to_gpu(
+                torch.float16, input_gpu0, input_gpu1, source=input_cpu
+            )
+            assert converted[0].device == torch.device("cuda:0")
+            assert converted[1].device == torch.device("cuda:1")
+            assert converted[0].dtype == converted[1].dtype == torch.float16
+            assert kw["source"].device == torch.device("cuda:0")
+            assert kw["source"].dtype == torch.float16
+            assert torch.cuda.current_device() == 1
+    finally:
+        manager.release()
+    assert offload.move_args_to_gpu.__func__ is original.__func__
+    print("[MultiGPU smoke] MMGP dtype conversion preserves CUDA shard residency: OK")
+
+
 def check_minimax_h3_audio_vae_cross_gpu():
     """MiniMax H3 decoder/encoder accepts final-shard audio on cuda:1.
 
@@ -285,10 +341,16 @@ def check_minimax_h3_audio_vae_cross_gpu():
     def fake_decode(self, input_latents, return_dict=False):
         assert input_latents.device == torch.device("cuda:0")
         assert input_latents.dtype == torch.float32
-        return (self.dec_in_proj(input_latents),)
+        assert torch.cuda.current_device() == 0
+        # Regression: MMGP 3.8.2 uses .to(dtype).cuda() inside its forward
+        # wrapper, which used to force this tensor to the *last* shard.
+        mmgp_arg = input_latents.to(torch.float32).cuda(non_blocking=True)
+        assert mmgp_arg.device == torch.device("cuda:0")
+        return (self.dec_in_proj(mmgp_arg),)
 
     def fake_encode(self, waveform, return_dict=False):
         assert waveform.device == torch.device("cuda:0")
+        assert torch.cuda.current_device() == 0
         assert waveform.shape[1] == 1
         posterior = SimpleNamespace(
             mode=lambda: waveform.expand(-1, 4, -1).contiguous()
@@ -298,12 +360,16 @@ def check_minimax_h3_audio_vae_cross_gpu():
     with torch.inference_mode():
         incoming_latents = torch.randn(1, 4, 2, 7, device="cuda:1")
         incoming_audio = torch.randn(1, 2, 56, device="cuda:1")
-        with patch.object(AutoencoderKLMiniMaxH3Audio, "decode", fake_decode):
-            wave = vae.decode(incoming_latents)
+        with torch.cuda.device("cuda:1"):
+            assert torch.cuda.current_device() == 1
+            with patch.object(AutoencoderKLMiniMaxH3Audio, "decode", fake_decode):
+                wave = vae.decode(incoming_latents)
+            assert torch.cuda.current_device() == 1
+            with patch.object(AutoencoderKLMiniMaxH3Audio, "encode", fake_encode):
+                encoded = vae.encode(incoming_audio)
+            assert torch.cuda.current_device() == 1
         assert wave.device == torch.device("cuda:0")
         assert wave.shape == (1, 2, 7)
-        with patch.object(AutoencoderKLMiniMaxH3Audio, "encode", fake_encode):
-            encoded = vae.encode(incoming_audio)
         assert encoded.device == torch.device("cuda:0")
         assert encoded.shape == (1, 4, 2, 56)
 
@@ -315,7 +381,7 @@ def check_minimax_h3_audio_vae_cross_gpu():
         assert wave_single.device == torch.device("cuda:0")
         torch.testing.assert_close(wave_single, wave)
 
-    print("[MultiGPU smoke] MiniMax H3 audio VAE GPU1 -> GPU0 decode/encode: OK")
+    print("[MultiGPU smoke] MiniMax H3 audio VAE active cuda:1 -> cuda:0 decode/encode: OK")
 
 
 def check_minimax_h3_text_conditioning():
@@ -518,6 +584,7 @@ def main() -> int:
         check_ltx2_tiled_vae_device_switch()
         check_minimax_h3_text_conditioning()
         check_minimax_h3_audio_vae_cross_gpu()
+        check_mmgp_implicit_cuda_conversion()
 
     print("[MultiGPU smoke] PASS")
     return 0
