@@ -100,7 +100,7 @@ class DialogueDurationTest(unittest.TestCase):
             "рыболоветское судно. На среднем плане посреди поля стоит небольшая "
             "белая церковь и на золотом куполе блестит солнечный блик."
         )
-        prompt = "Speaker 1:\\n[Russian, thoughtful and close to the microphone] " + narration
+        prompt = "Speaker 1:\n[Russian, thoughtful and close to the microphone] " + narration
         turns = DIALOGUE.plan_dialogue(prompt, seed=624071210, duration_seconds=120)
         self.assertGreaterEqual(len(turns), 3)
         self.assertEqual(" ".join(turn.text for turn in turns), narration)
