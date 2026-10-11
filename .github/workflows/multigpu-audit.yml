@@ -39,6 +39,7 @@ jobs:
             models/TTS/chatterbox/mtl_tts.py \
             models/TTS/chatterbox/pipeline.py \
             models/minimax_h3/transformer.py \
+            models/minimax_h3/audio_vae.py \
             plugins/about/plugin.py \
             scripts/multigpu_smoke.py
       - name: Verify README and UI project attribution
