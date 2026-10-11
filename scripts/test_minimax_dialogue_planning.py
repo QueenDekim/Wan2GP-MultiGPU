@@ -66,13 +66,14 @@ class DialogueDurationTest(unittest.TestCase):
             seed=1234,
             duration_seconds=120,
         )
-        self.assertEqual(len(turns), 1)
-        self.assertGreater(turns[0].duration_s, 10)
-        self.assertLess(turns[0].duration_s, 120)
-        self.assertEqual(turns[0].language_code, "ru")
+        self.assertGreaterEqual(len(turns), 2)
+        self.assertEqual(" ".join(turn.text for turn in turns), phrase)
+        self.assertTrue(all(4 <= turn.duration_s <= 15 for turn in turns))
+        self.assertTrue(all(turn.language_code == "ru" for turn in turns))
+        self.assertGreater(sum(turn.duration_s for turn in turns), 10)
 
     def test_long_russian_monologue_is_split_without_losing_text(self):
-        phrase = " ".join("заснеженный простор и величественная река" for _ in range(60))
+        phrase = " ".join("заснеженный простор и величественная река" for _ in range(48))
         turns = DIALOGUE.plan_dialogue(
             "Speaker 1:\n[Russian, calm] " + phrase,
             seed=77,
@@ -89,6 +90,39 @@ class DialogueDurationTest(unittest.TestCase):
         self.assertGreater(total, 90)
         self.assertEqual([turn.seed for turn in turns],
                          [77 + i * 1000 for i in range(len(turns))])
+
+    def test_reported_russian_narration_stays_under_fifteen_seconds_per_take(self):
+        narration = (
+            "Камера поворачивается на 180 градусов пролетает за женщину и отдаляется так "
+            "что становится видно что женщина стоит на заснеженном холме с которого "
+            "открывается вид на бескрайний заснеженный простор залитый снегом. "
+            "На горизонте виден лес и огромная река по которой плывет "
+            "рыболоветское судно. На среднем плане посреди поля стоит небольшая "
+            "белая церковь и на золотом куполе блестит солнечный блик."
+        )
+        prompt = "Speaker 1:\\n[Russian, thoughtful and close to the microphone] " + narration
+        turns = DIALOGUE.plan_dialogue(prompt, seed=624071210, duration_seconds=120)
+        self.assertGreaterEqual(len(turns), 3)
+        self.assertEqual(" ".join(turn.text for turn in turns), narration)
+        self.assertTrue(all(turn.speaker == 1 for turn in turns))
+        self.assertTrue(all(turn.language_code == "ru" for turn in turns))
+        self.assertTrue(all(turn.duration_s <= 15.0 for turn in turns))
+        self.assertGreater(sum(turn.duration_s for turn in turns), 20.0)
+        self.assertLess(sum(turn.duration_s for turn in turns), 120.0)
+
+    def test_clause_boundary_preferred_to_arbitrary_word_cut(self):
+        # A comma near the target interval should be used rather than
+        # separating tightly connected words in a long narration.
+        narration = (
+            "один два три четыре пять шесть семь восемь девять десять одиннадцать "
+            "двенадцать тринадцать четырнадцать пятнадцать шестнадцать семнадцать "
+            "восемнадцать девятнадцать двадцать двадцатьодин двадцатьдва, "
+            "затем начинается совершенно новая часть рассказа которая продолжается"
+        )
+        turns = DIALOGUE.plan_dialogue("Speaker 1: " + narration, seed=5, duration_seconds=120)
+        self.assertGreaterEqual(len(turns), 2)
+        self.assertTrue(turns[0].text.endswith(","))
+        self.assertEqual(" ".join(t.text for t in turns), narration)
 
     def test_total_duration_is_a_cap_not_target(self):
         prompt = "Speaker 1: Привет, это короткая реплика."
