@@ -122,14 +122,15 @@ def check_ltx2_tiled_vae_device_switch():
         TilingConfig,
     )
 
-    class SwitchingVAE:
+    class SwitchingVAE(nn.Module):
         latent_channels = 4
 
         def __init__(self, alternate=False):
+            super().__init__()
             self.alternate = alternate
             self.calls = 0
 
-        def __call__(self, tile):
+        def forward(self, tile):
             device = "cuda:1" if self.alternate and self.calls % 2 else "cuda:0"
             self.calls += 1
             return torch.ones(
