@@ -16,6 +16,11 @@ import torchaudio.functional as audio_F
 H3_DIALOGUE_GENERATION = True
 H3_DIALOGUE_MIN_SEGMENT_SECONDS = 4.0
 H3_DIALOGUE_MAX_SEGMENT_SECONDS = 45.0
+# H3's native audio range is ~15 seconds. Speech synthesized for 20-45s
+# in one pass often becomes indistinct, repeats, or drifts away from the
+# requested line. Prefer shorter chunks, keeping the 45s hard limit for
+# backwards compatibility with external callers.
+H3_DIALOGUE_PREFERRED_SEGMENT_SECONDS = 12.0
 H3_DIALOGUE_MAX_TOTAL_SECONDS = 5.0 * 60.0
 H3_DIALOGUE_MAX_REFERENCE_SECONDS = 15.0
 H3_DIALOGUE_AUDIO_SAMPLE_RATE = 32000
@@ -157,27 +162,62 @@ def _natural_duration(turn: DialogueTurn) -> float:
 
 
 def _split_long_turn(turn: DialogueTurn) -> list[DialogueTurn]:
-    """Split a long monologue into sequential turns without dropping words.
+    """Divide long speech into short, intelligible H3 takes.
 
-    H3 synthesizes at most 45 seconds in a segment. Previously a single
-    Speaker 1 block longer than that was silently limited to 45 seconds even
-    if the overall audio duration cap was 120 or 300 seconds. Each chunk
-    retains speaker, language, delivery instructions and voice reference.
+    Duration estimates are only a scheduling heuristic. Break at the latest
+    sensible sentence/clause boundary within the 12s target; fall back to a
+    word boundary if the input is an unpunctuated narration. Never invent,
+    omit, or reorder spoken words. Segments retain voice/language/directions.
     """
-    if _estimated_speech_seconds(turn.text) <= H3_DIALOGUE_MAX_SEGMENT_SECONDS:
+    if _estimated_speech_seconds(turn.text) <= H3_DIALOGUE_PREFERRED_SEGMENT_SECONDS:
         return [turn]
-    chunks, current = [], []
-    for word in turn.text.split():
-        candidate = " ".join((*current, word))
-        if current and _estimated_speech_seconds(candidate) > H3_DIALOGUE_MAX_SEGMENT_SECONDS:
-            chunks.append(replace(turn, text=" ".join(current)))
-            current = [word]
-        else:
-            current.append(word)
-    if current:
-        chunks.append(replace(turn, text=" ".join(current)))
-    return chunks
 
+    words = turn.text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        stop = start
+        while stop < len(words):
+            candidate = " ".join(words[start:stop + 1])
+            if (stop > start and
+                    _estimated_speech_seconds(candidate) > H3_DIALOGUE_PREFERRED_SEGMENT_SECONDS):
+                break
+            stop += 1
+        if stop == start:
+            stop += 1
+
+        # Avoid cutting in the middle of a sentence when a natural pause is
+        # available, provided that pause does not create a very short chunk.
+        boundaries = [
+            index for index in range(start + 1, stop + 1)
+            if words[index - 1].endswith((".", "!", "?", "…", ",", ";", ":", "。", "！", "？"))
+            and _estimated_speech_seconds(" ".join(words[start:index])) >= H3_DIALOGUE_MIN_SEGMENT_SECONDS
+        ]
+        if boundaries:
+            # Prefer terminal sentence endings over a comma, but do not
+            # sacrifice more than ~3s of the target to obtain one.
+            near = [index for index in boundaries
+                    if _estimated_speech_seconds(" ".join(words[start:index]))
+                    >= H3_DIALOGUE_PREFERRED_SEGMENT_SECONDS - 3.0]
+            if near:
+                stop = max(near, key=lambda i: (
+                    words[i - 1].endswith((".", "!", "?", "…", "。", "！", "？")), i
+                ))
+            else:
+                stop = boundaries[-1]
+
+        chunks.append(replace(turn, text=" ".join(words[start:stop])))
+        start = stop
+
+    if len(chunks) > 1:
+        tail = chunks[-1]
+        if _estimated_speech_seconds(tail.text) < H3_DIALOGUE_MIN_SEGMENT_SECONDS:
+            combined = chunks[-2].text + " " + tail.text
+            if _estimated_speech_seconds(combined) <= 15.0:
+                chunks[-2] = replace(chunks[-2], text=combined)
+                chunks.pop()
+
+    return chunks
 
 def plan_dialogue(prompt: str, seed: int, duration_seconds: float | None) -> list[DialogueTurn]:
     turns = parse_dialogue_prompt(prompt)
@@ -416,6 +456,13 @@ def generate_dialogue(pipeline, input_prompt: str, *, audio_guide=None, audio_gu
         f"{planned_duration:.1f}s estimated speech; maximum total audio={duration_limit:g}s",
         flush=True,
     )
+    for segment_index, segment in enumerate(turns, 1):
+        print(
+            f"[MiniMax H3 Dialogue] Segment {segment_index}/{len(turns)}: "
+            f"speaker={segment.speaker}, words={len(_normalize_words(segment.text))}, "
+            f"planned_duration={segment.duration_s:.2f}s",
+            flush=True,
+        )
     generated, generated_duration = [], 0.0
     for index, turn in enumerate(turns):
         pipeline._check_abort()
