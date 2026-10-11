@@ -65,8 +65,30 @@ class MiniMaxH3AudioVAE(AutoencoderKLMiniMaxH3Audio):
         if hasattr(self, "decoder"):
             self.decoder._interrupt = self._abort
 
+    def _on_audio_vae_device(self, tensor):
+        """Keep H3 audio processing beside its MMGP/Accelerate VAE weights.
+
+        The last transformer shard can return audio latents on cuda:1, while
+        MiniMaxH3AudioVAE's conv encoder/decoder run on primary cuda:0. This
+        boundary is called before the lazy MMGP conv forward loads its weights,
+        so the current parameter.device may still be CPU/mmap. Prefer the
+        primary device registered when MultiGPU installs; never route the
+        activation via system RAM. Preserve ordinary single-GPU behavior.
+        """
+        device = getattr(self, "_multigpu_primary_device", None)
+        if device is None:
+            # Without MultiGPU, respect the actual resident VAE weights. CPU
+            # checkpoint backing must not force CUDA activations back to RAM.
+            weight = self.dec_in_proj.weight
+            device = weight.device if weight.device.type == "cuda" else tensor.device
+        device = torch.device(device)
+        if tensor.device != device:
+            tensor = tensor.to(device=device, non_blocking=True)
+        return tensor
+
     def encode(self, waveform):
         # WanGP boundary: [1, stereo, samples] -> official mono-batch [stereo, 1, samples].
+        waveform = self._on_audio_vae_device(waveform)
         posterior = super().encode(waveform[0].unsqueeze(1), return_dict=False)[0]
         latents = posterior.mode()
         mean = self._latents_mean.view(1, -1, 1).to(latents)
@@ -75,6 +97,10 @@ class MiniMaxH3AudioVAE(AutoencoderKLMiniMaxH3Audio):
 
     def decode(self, latents):
         # WanGP boundary: [1, channels, stereo, frames] -> official mono-batch.
+        # Transformer outputs can be on the final shard (cuda:1); VAE
+        # convolution weights are on cuda:0. Move the small latent before
+        # denormalization rather than copying decoded waveforms/weights to RAM.
+        latents = self._on_audio_vae_device(latents)
         latents = latents[0].permute(1, 0, 2)
         mean = self._latents_mean.view(1, -1, 1).to(latents)
         std = self._latents_std.view(1, -1, 1).to(latents)
