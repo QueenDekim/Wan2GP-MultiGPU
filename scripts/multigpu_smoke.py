@@ -108,6 +108,62 @@ class GemmaLike(nn.Module):
         return self.lm_head(self.model.norm(hidden))
 
 
+
+def check_ltx2_tiled_vae_device_switch():
+    """Tiled VAE latent stitching tolerates CUDA output-device changes.
+
+    Video extension / first-last-frame conditioning can call the encoder
+    repeatedly. Simulate an MMGP stage transition between tiles and verify
+    that the assembled latent and masks stay on the input GPU.
+    """
+    from models.ltx2.ltx_core.model.video_vae.video_vae import encode_video
+    from models.ltx2.ltx_core.model.video_vae.tiling import (
+        SpatialTilingConfig,
+        TilingConfig,
+    )
+
+    class SwitchingVAE:
+        latent_channels = 4
+
+        def __init__(self, alternate=False):
+            self.alternate = alternate
+            self.calls = 0
+
+        def __call__(self, tile):
+            device = "cuda:1" if self.alternate and self.calls % 2 else "cuda:0"
+            self.calls += 1
+            return torch.ones(
+                (
+                    tile.shape[0],
+                    self.latent_channels,
+                    (tile.shape[2] - 1) // 8 + 1,
+                    tile.shape[3] // 32,
+                    tile.shape[4] // 32,
+                ),
+                device=device,
+                dtype=tile.dtype,
+            )
+
+    video = torch.zeros((1, 3, 9, 128, 128), device="cuda:0")
+    tiling = TilingConfig(
+        spatial_config=SpatialTilingConfig(
+            tile_size_in_pixels=64,
+            tile_overlap_in_pixels=0,
+        )
+    )
+    with torch.inference_mode():
+        stable_vae = SwitchingVAE()
+        expected = encode_video(video, stable_vae, tiling)
+        switching_vae = SwitchingVAE(alternate=True)
+        actual = encode_video(video, switching_vae, tiling)
+
+    assert switching_vae.calls > 1, "Test must exercise multiple VAE tiles"
+    assert actual.device == video.device
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    print("[MultiGPU smoke] LTX2 tiled VAE cross-GPU accumulation: OK")
+
+
 def check_gguf_direct_cuda_transfer(manager):
     """Exercise LTX2 GGUFSourceTensor root-parameter preplacement on CUDA."""
     from shared.qtypes.gguf import GGUFSourceTensor
@@ -324,6 +380,7 @@ def main() -> int:
         check_gemma_vram_budget(manager)
         check_nested_mmgp_restore(manager)
         check_gguf_direct_cuda_transfer(manager)
+        check_ltx2_tiled_vae_device_switch()
 
     print("[MultiGPU smoke] PASS")
     return 0
