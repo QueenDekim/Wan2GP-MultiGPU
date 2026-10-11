@@ -15,6 +15,8 @@
 # Modified for WanGP: stereo boundary layout, latent normalization, MMGP dtype locking,
 # and the compact encode/decode API used by the WanGP pipeline.
 
+from contextlib import nullcontext
+
 import torch
 
 from .components.audio_autoencoder import AutoencoderKLMiniMaxH3Audio
@@ -89,7 +91,12 @@ class MiniMaxH3AudioVAE(AutoencoderKLMiniMaxH3Audio):
     def encode(self, waveform):
         # WanGP boundary: [1, stereo, samples] -> official mono-batch [stereo, 1, samples].
         waveform = self._on_audio_vae_device(waveform)
-        posterior = super().encode(waveform[0].unsqueeze(1), return_dict=False)[0]
+        # Some MMGP 3.8.2 wrappers use bare .cuda(), which follows the
+        # thread's last active shard instead of the VAE's parameter device.
+        # Pin the CUDA context only for this unsharded Audio VAE operation.
+        context = torch.cuda.device(waveform.device) if waveform.is_cuda else nullcontext()
+        with context:
+            posterior = super().encode(waveform[0].unsqueeze(1), return_dict=False)[0]
         latents = posterior.mode()
         mean = self._latents_mean.view(1, -1, 1).to(latents)
         std = self._latents_std.view(1, -1, 1).to(latents)
@@ -104,7 +111,9 @@ class MiniMaxH3AudioVAE(AutoencoderKLMiniMaxH3Audio):
         latents = latents[0].permute(1, 0, 2)
         mean = self._latents_mean.view(1, -1, 1).to(latents)
         std = self._latents_std.view(1, -1, 1).to(latents)
-        waveform = super().decode(latents * std + mean, return_dict=False)[0]
+        context = torch.cuda.device(latents.device) if latents.is_cuda else nullcontext()
+        with context:
+            waveform = super().decode(latents * std + mean, return_dict=False)[0]
         return waveform.transpose(0, 1)
 
 
