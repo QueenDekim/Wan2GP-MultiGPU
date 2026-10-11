@@ -2165,6 +2165,12 @@ class AccelerateMultiGPU:
 
     def _dispatch(self, model_id):
         model = self.offload.models[model_id]
+        # Model-specific preprocessing often runs outside nn.Module.forward,
+        # while MMGP weights may already be unloaded back to mmap/CPU.
+        # Preserve the primary execution device independently of weight.device
+        # so Qwen/other sharded encoders can hand GPU1 outputs to GPU0
+        # preprocessing layers without activating host-memory fallback.
+        object.__setattr__(model, "_multigpu_primary_device", self.devices[0])
 
         if model_id in self.dispatched:
             return self.dispatched[model_id]
