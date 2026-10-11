@@ -419,7 +419,19 @@ class MiniMaxH3Pipeline:
 
     @property
     def device(self):
-        return torch.device("cuda" if torch.cuda.is_available() else next(self.transformer.parameters()).device)
+        if torch.cuda.is_available():
+            # Bare torch.device("cuda") follows the active CUDA context. After
+            # the last MiniMax H3/Qwen shard runs on cuda:1, the next dialogue
+            # segment may start with cuda:1 even though embed_tokens and
+            # root preprocessing are mapped to cuda:0. Use the explicit
+            # primary-device marker installed by AccelerateMultiGPU before
+            # the first MMGP dispatch. Preserve the single-GPU default when
+            # no MultiGPU manager is installed.
+            primary = getattr(self.transformer, "_multigpu_primary_device", None)
+            if primary is not None:
+                return torch.device(primary)
+            return torch.device("cuda")
+        return next(self.transformer.parameters()).device
 
     def get_loras_transformer(self, _get_model_recursive_prop, model_type, model_def, guidance_phases, activated_loras, **_kwargs):
         if model_def.get("vdn", False):
